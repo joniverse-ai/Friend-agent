@@ -500,7 +500,7 @@ async function send(text) {
         const e = JSON.parse(line);
         if (e.type === "turn") { tTurn = performance.now(); panel?.turn(e); if (e.action === "safety") bubble.classList.add("safety"); }
         else if (e.type === "tool") panel?.tool(e);
-        else if (e.type === "effect") e.layer === "prop" ? fx.prop(e.name) : fx.play(e.name, e.level);
+        else if (e.type === "effect") { e.layer === "prop" ? fx.prop(e.name) : fx.play(e.name, e.level); panel?.effect(e); }
         else if (e.type === "context") panel?.context(e);
         else if (e.type === "reminder") note(under, "rem", (e.action === "create_reminder" ? "⏰ " : "🗑 ") + e.summary);
         else if (e.type === "delta") {
@@ -953,6 +953,11 @@ function startPanel() {
     memory(e) {
       const rows = [...e.added.map(m => `<li>추가: ${esc(m)}</li>`), ...e.updated.map(m => `<li>수정: ${esc(m)}</li>`), ...e.removed.map(m => `<li>삭제: ${esc(m)}</li>`)];
       $("#p-mem").innerHTML = `<h4><b>4</b>기억 정리</h4>${rows.length ? `<ul class="mlist">${rows.join("")}</ul>` : `<div class="mute">이번 턴에서 새로 기억한 것 없음</div>`}`;
+    },
+    effect(e) {   // 화면 효과로 무엇이 골라졌는지: 배경은 도구 선택 칸, 소품은 기억 정리 칸에 덧붙인다
+      const scene = e.layer !== "prop";
+      $(scene ? "#p-turn" : "#p-mem").insertAdjacentHTML("beforeend",
+        `<div class="reason">🎬 화면 효과 · ${scene ? "배경" : "소품"}: <b>${esc(e.name)}</b></div>`);
     },
     timing(t) {
       const f = ms => ms == null ? "-" : (ms / 1000).toFixed(1) + "초";

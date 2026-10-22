@@ -2,9 +2,10 @@
 
 ① 안전장치: 위기 표현이면 정해진 안전 응답으로 끝낸다(코드 규칙).
 ② 도구 선택: 모델이 도구를 0~2개 고른다. 확신이 낮으면 되묻는다(router.py).
-③ 도구 실행: 날씨, 미세먼지, 공휴일, 약속(tools.py). 질문에 맞는 배경 효과를 고른다(effects.py).
-④ 답 생성: 캐릭터 지시문 + 기억 + 도구 결과 + 최근 대화로 답을 스트리밍한다. 답에 맞는 소품 효과를 고른다.
+③ 도구 실행: 날씨, 미세먼지, 공휴일, 약속(tools.py). 질문에 맞는 배경 효과를 보낸다(effects.py, ②와 동시에 고름).
+④ 답 생성: 캐릭터 지시문 + 기억 + 도구 결과 + 최근 대화로 답을 스트리밍한다.
 ⑤ 기억 정리: 답을 다 보낸 뒤 같은 요청 안에서 기억 메모와 대화 요약을 갱신한다(memory.py).
+   같은 때에 답에 맞는 소품 효과를 고른다(effects.py).
    Cloud Run 기본 설정(요청 기반 과금)에서는 응답이 끝난 뒤 CPU가 거의 주어지지 않아서,
    응답 뒤 백그라운드로 돌리면 기억 정리가 멈추거나 늦어진다. 그래서 응답을 닫기 전에 처리한다.
 
@@ -55,7 +56,8 @@ def run_turn(message, uid, llm, store, show_panel):
         yield {"type": "done", "message_id": saved["id"]}
         return
 
-    # ② 도구 선택
+    # ② 도구 선택. 화면 배경 효과 고르기(효과 전용 AI 호출)를 동시에 시작해 둔다.
+    scene_job = effects.start_scene(message, history, llm)
     choice = choose(message, history, now, settings["location"], llm)
     if show_panel:
         yield {"type": "turn", "tools": [{"name": t["name"], "label": TOOLS[t["name"]]["label"], "args": t["args"]}
@@ -72,8 +74,10 @@ def run_turn(message, uid, llm, store, show_panel):
                    "summary": r.summary, "data": r.data}
         if r.ok and r.name in ("create_reminder", "cancel_reminder"):
             yield {"type": "reminder", "action": r.name, "summary": r.summary}
-    # 화면 효과 ① 배경 장면: 도구 결과 또는 질문 속 핵심 단어. 개발용 패널과 상관없이 보내고, 주제 이름과 세기만 담는다.
-    scene = effects.scene(message, results) if choice.action != "clarify" else None
+    # 화면 효과 ① 배경 장면: 도구 결과가 우선, 없으면 효과 전용 AI가 고른 주제(fake 모드는 단어 사전).
+    # 개발용 패널과 상관없이 보내고, 주제 이름과 세기만 담는다.
+    scene_ai = effects.result(scene_job, "scene")
+    scene = effects.scene(message, results, scene_ai) if choice.action != "clarify" else None
     if scene:
         yield {"type": "effect", "layer": "scene", **scene}
 
@@ -87,20 +91,21 @@ def run_turn(message, uid, llm, store, show_panel):
     for chunk in llm.chat_stream([{"role": "system", "content": system}, *history, {"role": "user", "content": message}]):
         reply += chunk
         yield {"type": "delta", "text": chunk}
-    # 화면 효과 ② 포인트 소품: 답 속 핵심 단어, 없으면 배경과 같은 주제
-    accent = effects.prop(reply, scene and scene["name"]) if choice.action != "clarify" else None
-    if accent:
-        yield {"type": "effect", "layer": "prop", **accent}
     meta = {"tools": [t["name"] for t in choice.tools], "confidence": choice.confidence,
             "action": choice.action, "guards": choice.guards}
     saved = store.add_message(uid, "assistant", reply, meta)
 
-    # ⑤ 기억 정리
+    # ⑤ 기억 정리. 화면 소품 효과 고르기(효과 전용 AI 호출)를 동시에 시작해 둔다.
+    prop_job = effects.start_prop(message, reply, llm) if choice.action != "clarify" else None
     yield {"type": "memory_start"}
     changes = memory.update_memories(store, uid, message, reply, now, llm)
     memory.maybe_summarize(store, uid, llm)
     yield {"type": "memory", "added": [m["text"] for m in changes["added"]],
            "updated": [m["text"] for m in changes["updated"]], "removed": [m["text"] for m in changes["removed"]]}
+    # 화면 효과 ② 포인트 소품: 효과 전용 AI가 완성된 답을 보고 고른 주제(fake 모드는 단어 사전)
+    accent = effects.prop(reply, scene and scene["name"], effects.result(prop_job, "prop")) if choice.action != "clarify" else None
+    if accent:
+        yield {"type": "effect", "layer": "prop", **accent}
     yield {"type": "done", "message_id": saved["id"]}
 
 
