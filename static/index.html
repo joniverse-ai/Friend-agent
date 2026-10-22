@@ -95,6 +95,9 @@ body.has-banner .app{height:calc(100dvh - 34px)}
 .row.them:hover .report,.report:focus-visible{opacity:1}
 .day{align-self:center;font-size:12px;font-weight:700;background:var(--white);padding:3px 14px;border-radius:var(--pill)}
 
+/* 질문에 맞는 화면 효과: 대화창 전체를 덮고, 클릭은 아래로 통과시킨다 */
+.fx{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:5}
+
 .composer{padding:10px 24px 22px}
 .composer-in{max-width:760px;margin:0 auto}
 .suggest{display:flex;gap:8px;overflow-x:auto;padding-bottom:10px;scrollbar-width:none}
@@ -266,6 +269,7 @@ select.input{appearance:none;background-image:linear-gradient(45deg,transparent 
     </header>
 
     <section id="view-chat" class="main" style="flex:1;min-height:0">
+      <canvas class="fx" id="fx" aria-hidden="true" hidden></canvas>
       <div class="chat" id="chat"><div class="thread" id="thread"></div></div>
       <div class="composer"><div class="composer-in">
         <div class="suggest" id="suggest"></div>
@@ -496,6 +500,7 @@ async function send(text) {
         const e = JSON.parse(line);
         if (e.type === "turn") { tTurn = performance.now(); panel?.turn(e); if (e.action === "safety") bubble.classList.add("safety"); }
         else if (e.type === "tool") panel?.tool(e);
+        else if (e.type === "effect") fx.play(e.name, e.level);
         else if (e.type === "context") panel?.context(e);
         else if (e.type === "reminder") note(under, "rem", (e.action === "create_reminder" ? "⏰ " : "🗑 ") + e.summary);
         else if (e.type === "delta") {
@@ -538,6 +543,160 @@ const autosize = () => { const t = $("#input"); t.style.height = "auto"; t.style
 $("#input").addEventListener("input", autosize);
 $("#suggest").innerHTML = SUGGEST.map(s => `<button type="button">${esc(s)}</button>`).join("");
 $("#suggest").addEventListener("click", e => { if (e.target.tagName === "BUTTON") send(e.target.textContent); });
+
+// ── 질문에 맞는 화면 효과 ───────────────────────────────────
+// 서버가 보낸 효과 이름(rain, snow, sun …)에 맞춰 대화창 위에 약 5초 동안 애니메이션을 그린다.
+// 움직임 줄이기 설정을 켠 사용자에게는 그리지 않는다.
+const fx = (() => {
+  const canvas = $("#fx"), ctx = canvas.getContext("2d");
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)");
+  const C = {ink: "#111111", green: "#5FD13F", orange: "#FF8A2B", blue: "#5B5FD6", white: "#ffffff"};
+  const DUR = 5200, FADE = 900;
+  const COUNT = {rain: 150, storm: 210, snow: 90, confetti: 130, dust: 170, fresh: 26, cloud: 6, fog: 7, sun: 0, alarm: 0};
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  let raf = 0, dt = 1, last = 0, kind = null, level = 0.6, t0 = 0, W = 0, H = 0, parts = [], bolt = null, boltAt = -1;
+
+  function size() {
+    const r = canvas.getBoundingClientRect(), d = window.devicePixelRatio || 1;
+    W = r.width; H = r.height; canvas.width = Math.round(W * d); canvas.height = Math.round(H * d);
+    ctx.setTransform(d, 0, 0, d, 0, 0);
+  }
+  const make = {
+    // 비, 눈은 처음부터 화면 곳곳에 흩어져 시작해야 바로 "오고 있는" 느낌이 난다
+    rain: () => ({x: rnd(-60, W), y: rnd(-H * 0.2, H), v: rnd(9, 15), l: rnd(12, 22)}),
+    storm: () => ({x: rnd(-80, W), y: rnd(-H * 0.2, H), v: rnd(13, 19), l: rnd(16, 26)}),
+    snow: () => ({x: rnd(0, W), y: rnd(-H * 0.1, H), v: rnd(0.8, 1.8), r: rnd(3, 7), p: rnd(0, 6.3)}),
+    confetti: () => ({x: rnd(0, W), y: rnd(-H * 0.5, 0), v: rnd(2.5, 4.5), w: rnd(6, 11), h: rnd(10, 16), a: rnd(0, 6.3), s: rnd(-0.15, 0.15), p: rnd(0, 6.3), c: [C.green, C.orange, C.blue, C.ink][Math.floor(rnd(0, 4))]}),
+    dust: () => ({x: rnd(0, W), y: rnd(0, H), vx: rnd(0.2, 0.9), vy: rnd(-0.25, 0.25), r: rnd(1.5, 4)}),
+    fresh: () => ({x: rnd(0, W), y: rnd(H, H * 1.6), v: rnd(1, 2.2), a: rnd(0, 6.3), s: rnd(-0.03, 0.03), p: rnd(0, 6.3)}),
+    cloud: () => ({x: rnd(-W * 0.4, W), y: rnd(20, H * 0.45), v: rnd(0.4, 0.9), k: rnd(0.7, 1.3)}),
+    fog: () => ({x: rnd(-W, W), y: rnd(0, H), v: rnd(0.3, 0.7), w: rnd(W * 0.5, W), h: rnd(40, 90)}),
+  };
+  const outline = (w = 2) => { ctx.strokeStyle = C.ink; ctx.lineWidth = w; };
+
+  function drops(color, width) {
+    ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineCap = "round"; ctx.beginPath();
+    for (const p of parts) {
+      p.y += p.v * dt; p.x += p.v * 0.25 * dt;
+      if (p.y > H + 30) { p.y = rnd(-40, 0); p.x = rnd(-60, W); }
+      ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.l * 0.25, p.y - p.l);
+    }
+    ctx.stroke();
+  }
+  function cloudShape(x, y, k) {
+    ctx.beginPath();
+    ctx.arc(x, y, 26 * k, Math.PI * 0.5, Math.PI * 1.5);
+    ctx.arc(x + 30 * k, y - 22 * k, 30 * k, Math.PI, Math.PI * 2);
+    ctx.arc(x + 66 * k, y - 8 * k, 22 * k, Math.PI * 1.3, Math.PI * 0.5);
+    ctx.closePath(); ctx.fillStyle = C.white; ctx.fill(); outline(2); ctx.stroke();
+  }
+  const draw = {
+    rain() { ctx.fillStyle = "rgba(91,95,214,0.07)"; ctx.fillRect(0, 0, W, H); drops(C.blue, 2); },
+    storm(el) {
+      ctx.fillStyle = "rgba(17,17,17,0.12)"; ctx.fillRect(0, 0, W, H); drops(C.blue, 2.2);
+      const n = Math.floor(el / 1500);
+      if (n !== boltAt && el % 1500 < 60) {
+        boltAt = n; let x = rnd(W * 0.2, W * 0.8), y = 0; bolt = {pts: [[x, y]], life: 1};
+        while (y < H * 0.6) { x += rnd(-30, 30); y += rnd(30, 60); bolt.pts.push([x, y]); }
+      }
+      if (bolt && bolt.life > 0.02) {
+        ctx.fillStyle = `rgba(255,255,255,${0.55 * bolt.life})`; ctx.fillRect(0, 0, W, H);
+        ctx.beginPath(); bolt.pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+        ctx.strokeStyle = C.ink; ctx.lineWidth = 7; ctx.stroke(); ctx.strokeStyle = "#FFD23F"; ctx.lineWidth = 3.5; ctx.stroke();
+        bolt.life *= Math.pow(0.86, dt);
+      }
+    },
+    snow(el) {
+      for (const p of parts) {
+        p.y += p.v * dt; p.x += Math.sin(el / 600 + p.p) * 0.6 * dt;
+        if (p.y > H + 10) { p.y = -10; p.x = rnd(0, W); }
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.3); ctx.fillStyle = C.white; ctx.fill(); outline(1.5); ctx.stroke();
+      }
+    },
+    sun(el) {
+      const x = W - 96, y = 96, g = ctx.createRadialGradient(x, y, 20, x, y, Math.max(W, H));
+      g.addColorStop(0, "rgba(255,138,43,0.30)"); g.addColorStop(1, "rgba(255,138,43,0)");
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+      ctx.save(); ctx.translate(x, y); ctx.rotate(el / 1800);
+      outline(4); ctx.lineCap = "round";
+      for (let i = 0; i < 12; i++) { ctx.rotate(Math.PI / 6); ctx.beginPath(); ctx.moveTo(0, 54); ctx.lineTo(0, 54 + 18 + 8 * Math.sin(el / 200 + i)); ctx.stroke(); }
+      ctx.restore();
+      ctx.beginPath(); ctx.arc(x, y, 44, 0, 6.3); ctx.fillStyle = C.orange; ctx.fill(); outline(3); ctx.stroke();
+      ctx.fillStyle = C.ink; ctx.beginPath(); ctx.arc(x - 14, y - 6, 4, 0, 6.3); ctx.arc(x + 14, y - 6, 4, 0, 6.3); ctx.fill();
+      ctx.beginPath(); ctx.arc(x, y + 6, 14, 0.15 * Math.PI, 0.85 * Math.PI); outline(3); ctx.stroke();
+    },
+    cloud() {
+      for (const p of parts) { p.x += p.v * dt; if (p.x > W + 20) p.x = -110 * p.k; cloudShape(p.x, p.y, p.k); }
+    },
+    fog() {
+      ctx.fillStyle = "rgba(255,255,255,0.18)"; ctx.fillRect(0, 0, W, H);
+      for (const p of parts) {
+        p.x += p.v * dt; if (p.x > W) p.x = -p.w;
+        ctx.beginPath(); ctx.ellipse(p.x + p.w / 2, p.y, p.w / 2, p.h / 2, 0, 0, 6.3); ctx.fillStyle = "rgba(255,255,255,0.45)"; ctx.fill();
+      }
+    },
+    dust() {
+      ctx.fillStyle = `rgba(150,128,96,${0.08 + 0.2 * level})`; ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = "rgba(90,78,60,0.55)";
+      for (const p of parts) {
+        p.x += p.vx * dt; p.y += p.vy * dt; if (p.x > W + 5) p.x = -5;
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.3); ctx.fill();
+      }
+    },
+    fresh(el) {
+      ctx.fillStyle = "rgba(95,209,63,0.08)"; ctx.fillRect(0, 0, W, H);
+      for (const p of parts) {
+        p.y -= p.v * dt; p.a += p.s * dt; p.x += Math.sin(el / 500 + p.p) * 0.7 * dt;
+        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.a);
+        ctx.beginPath(); ctx.moveTo(-14, 0); ctx.quadraticCurveTo(0, -12, 14, 0); ctx.quadraticCurveTo(0, 12, -14, 0);
+        ctx.fillStyle = C.green; ctx.fill(); outline(1.6); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(-14, 0); ctx.lineTo(10, 0); ctx.stroke(); ctx.restore();
+      }
+    },
+    confetti(el) {
+      for (const p of parts) {
+        p.y += p.v * dt; p.a += p.s * dt; p.x += Math.sin(el / 400 + p.p) * 0.8 * dt;
+        if (p.y > H + 20 && el < DUR * 0.6) { p.y = -20; p.x = rnd(0, W); }
+        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.a); ctx.fillStyle = p.c;
+        ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h * Math.abs(Math.cos(el / 300 + p.p))); ctx.restore();
+      }
+    },
+    alarm(el) {
+      const x = W / 2, y = 120, ring = (el % 900) / 900;
+      for (const k of [ring, (ring + 0.5) % 1]) {
+        ctx.beginPath(); ctx.arc(x, y, 56 + k * 120, 0, 6.3); ctx.strokeStyle = `rgba(255,138,43,${1 - k})`; ctx.lineWidth = 4; ctx.stroke();
+      }
+      ctx.save(); ctx.translate(x, y); ctx.rotate(el < 2600 ? Math.sin(el / 45) * 0.22 : 0);
+      for (const s of [-1, 1]) { ctx.beginPath(); ctx.arc(s * 34, -38, 16, 0, 6.3); ctx.fillStyle = C.orange; ctx.fill(); outline(3); ctx.stroke(); }
+      ctx.beginPath(); ctx.arc(0, 0, 46, 0, 6.3); ctx.fillStyle = C.white; ctx.fill(); outline(4); ctx.stroke();
+      ctx.lineCap = "round"; outline(4); ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -28); ctx.moveTo(0, 0); ctx.lineTo(20, 8); ctx.stroke();
+      ctx.beginPath(); ctx.arc(0, 0, 5, 0, 6.3); ctx.fillStyle = C.ink; ctx.fill();
+      ctx.restore();
+    },
+  };
+
+  function frame(now) {
+    const el = now - t0;
+    if (el > DUR) return stop();
+    // 그리는 횟수가 적은 기기에서도 같은 속도로 움직이게, 지난 그림 뒤 흐른 시간만큼 움직인다(최대 3배)
+    dt = Math.min(3, (now - last) / 16.7); last = now;
+    ctx.clearRect(0, 0, W, H);
+    ctx.globalAlpha = el > DUR - FADE ? (DUR - el) / FADE : Math.min(1, el / 300);
+    draw[kind](el);
+    ctx.globalAlpha = 1;
+    raf = requestAnimationFrame(frame);
+  }
+  function stop() { cancelAnimationFrame(raf); ctx.clearRect(0, 0, W, H); canvas.hidden = true; kind = null; }
+  function play(name, lvl = 0.6) {
+    if (!draw[name] || reduce.matches || $("#view-chat").hidden) return;
+    stop(); kind = name; level = Math.min(1, Math.max(0, Number(lvl) || 0.6)); bolt = null; boltAt = -1;
+    canvas.hidden = false; size();
+    parts = make[name] ? Array.from({length: Math.round(COUNT[name] * (0.45 + 0.55 * level))}, make[name]) : [];
+    t0 = last = performance.now(); raf = requestAnimationFrame(frame);
+  }
+  addEventListener("resize", () => { if (kind) size(); });
+  return {play, stop};
+})();
 
 // ── 사진 글자 읽기 ───────────────────────────────────────────
 $("#photoBtn").onclick = () => $("#photoInput").click();
@@ -713,6 +872,9 @@ $("#deleteAll").onclick = async () => {
   paintCharacter(); refreshCount();
   if (!me.has_character) { $("#setupTitle").textContent = "캐릭터 만들기"; show("setup"); return; }
   await loadHistory();
+  // 개발 환경에서만: 주소 뒤에 ?fx=snow 처럼 붙이면 AI 없이 효과를 바로 재생해 본다.
+  const tryFx = new URLSearchParams(location.search).get("fx");
+  if (tryFx && cfg.show_turn_panel) fx.play(tryFx, 0.8);
   await greet();
   $("#input").focus();
 })();

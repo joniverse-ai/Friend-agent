@@ -2,7 +2,7 @@
 
 ① 안전장치: 위기 표현이면 정해진 안전 응답으로 끝낸다(코드 규칙).
 ② 도구 선택: 모델이 도구를 0~2개 고른다. 확신이 낮으면 되묻는다(router.py).
-③ 도구 실행: 날씨, 미세먼지, 공휴일, 약속(tools.py).
+③ 도구 실행: 날씨, 미세먼지, 공휴일, 약속(tools.py). 결과에 맞는 화면 효과를 하나 고른다(effects.py).
 ④ 답 생성: 캐릭터 지시문 + 기억 + 도구 결과 + 최근 대화로 답을 스트리밍한다.
 ⑤ 기억 정리: 답을 다 보낸 뒤 같은 요청 안에서 기억 메모와 대화 요약을 갱신한다(memory.py).
    Cloud Run 기본 설정(요청 기반 과금)에서는 응답이 끝난 뒤 CPU가 거의 주어지지 않아서,
@@ -12,7 +12,7 @@
 """
 from datetime import timedelta
 
-from app import memory, when
+from app import effects, memory, when
 from app.logs import log
 from app.persona import DEFAULT_CHARACTER, build_persona
 from app.router import choose
@@ -72,6 +72,10 @@ def run_turn(message, uid, llm, store, show_panel):
                    "summary": r.summary, "data": r.data}
         if r.ok and r.name in ("create_reminder", "cancel_reminder"):
             yield {"type": "reminder", "action": r.name, "summary": r.summary}
+    # 질문에 맞는 화면 효과. 개발용 패널과 상관없이 보내고, 효과 이름과 세기만 담는다.
+    effect = effects.pick(results) if choice.action != "clarify" else None
+    if effect:
+        yield {"type": "effect", **effect}
 
     # ④ 답 생성
     system = system_prompt(character, now, settings["location"], memories, summary,
