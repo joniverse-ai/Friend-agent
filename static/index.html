@@ -500,7 +500,7 @@ async function send(text) {
         const e = JSON.parse(line);
         if (e.type === "turn") { tTurn = performance.now(); panel?.turn(e); if (e.action === "safety") bubble.classList.add("safety"); }
         else if (e.type === "tool") panel?.tool(e);
-        else if (e.type === "effect") fx.play(e.name, e.level);
+        else if (e.type === "effect") e.layer === "prop" ? fx.prop(e.name) : fx.play(e.name, e.level);
         else if (e.type === "context") panel?.context(e);
         else if (e.type === "reminder") note(under, "rem", (e.action === "create_reminder" ? "⏰ " : "🗑 ") + e.summary);
         else if (e.type === "delta") {
@@ -544,158 +544,357 @@ $("#input").addEventListener("input", autosize);
 $("#suggest").innerHTML = SUGGEST.map(s => `<button type="button">${esc(s)}</button>`).join("");
 $("#suggest").addEventListener("click", e => { if (e.target.tagName === "BUTTON") send(e.target.textContent); });
 
-// ── 질문에 맞는 화면 효과 ───────────────────────────────────
-// 서버가 보낸 효과 이름(rain, snow, sun …)에 맞춰 대화창 위에 약 5초 동안 애니메이션을 그린다.
-// 움직임 줄이기 설정을 켠 사용자에게는 그리지 않는다.
+// ── 질문과 답에 맞는 화면 효과 ───────────────────────────────
+// 서버가 두 번 알려 준다. ① 배경 장면(scene): 질문 직후, ② 포인트 소품(prop): 답이 다 온 뒤.
+// 배경은 대화창 전체에 약 6초, 소품은 위쪽 가운데에 약 3.4초 그린다. 움직임 줄이기 설정이면 그리지 않는다.
 const fx = (() => {
   const canvas = $("#fx"), ctx = canvas.getContext("2d");
   const reduce = matchMedia("(prefers-reduced-motion: reduce)");
-  const C = {ink: "#111111", green: "#5FD13F", orange: "#FF8A2B", blue: "#5B5FD6", white: "#ffffff"};
-  const DUR = 5200, FADE = 900;
-  const COUNT = {rain: 150, storm: 210, snow: 90, confetti: 130, dust: 170, fresh: 26, cloud: 6, fog: 7, sun: 0, alarm: 0};
+  const C = {ink: "#111111", green: "#5FD13F", orange: "#FF8A2B", blue: "#5B5FD6", white: "#ffffff",
+             pink: "#FF8FB1", red: "#E5484D", gold: "#FFD23F", brown: "#9A5B2B", sky: "#7FD6F5", tan: "#F3D2A2"};
+  const SCENE_MS = 6000, PROP_MS = 3400, FADE = 900;
   const rnd = (a, b) => a + Math.random() * (b - a);
-  let raf = 0, dt = 1, last = 0, kind = null, level = 0.6, t0 = 0, W = 0, H = 0, parts = [], bolt = null, boltAt = -1;
+  const any = arr => arr[Math.floor(Math.random() * arr.length)];
+  let raf = 0, dt = 1, last = 0, W = 0, H = 0, S = null, P = null;
 
   function size() {
     const r = canvas.getBoundingClientRect(), d = window.devicePixelRatio || 1;
     W = r.width; H = r.height; canvas.width = Math.round(W * d); canvas.height = Math.round(H * d);
     ctx.setTransform(d, 0, 0, d, 0, 0);
   }
-  const make = {
-    // 비, 눈은 처음부터 화면 곳곳에 흩어져 시작해야 바로 "오고 있는" 느낌이 난다
-    rain: () => ({x: rnd(-60, W), y: rnd(-H * 0.2, H), v: rnd(9, 15), l: rnd(12, 22)}),
-    storm: () => ({x: rnd(-80, W), y: rnd(-H * 0.2, H), v: rnd(13, 19), l: rnd(16, 26)}),
-    snow: () => ({x: rnd(0, W), y: rnd(-H * 0.1, H), v: rnd(0.8, 1.8), r: rnd(3, 7), p: rnd(0, 6.3)}),
-    confetti: () => ({x: rnd(0, W), y: rnd(-H * 0.5, 0), v: rnd(2.5, 4.5), w: rnd(6, 11), h: rnd(10, 16), a: rnd(0, 6.3), s: rnd(-0.15, 0.15), p: rnd(0, 6.3), c: [C.green, C.orange, C.blue, C.ink][Math.floor(rnd(0, 4))]}),
-    dust: () => ({x: rnd(0, W), y: rnd(0, H), vx: rnd(0.2, 0.9), vy: rnd(-0.25, 0.25), r: rnd(1.5, 4)}),
-    fresh: () => ({x: rnd(0, W), y: rnd(H, H * 1.6), v: rnd(1, 2.2), a: rnd(0, 6.3), s: rnd(-0.03, 0.03), p: rnd(0, 6.3)}),
-    cloud: () => ({x: rnd(-W * 0.4, W), y: rnd(20, H * 0.45), v: rnd(0.4, 0.9), k: rnd(0.7, 1.3)}),
-    fog: () => ({x: rnd(-W, W), y: rnd(0, H), v: rnd(0.3, 0.7), w: rnd(W * 0.5, W), h: rnd(40, 90)}),
-  };
-  const outline = (w = 2) => { ctx.strokeStyle = C.ink; ctx.lineWidth = w; };
+  const line = (w = 2) => { ctx.strokeStyle = C.ink; ctx.lineWidth = w; ctx.lineJoin = "round"; ctx.lineCap = "round"; };
+  const fs = (color, w = 2) => { ctx.fillStyle = color; ctx.fill(); line(w); ctx.stroke(); };
+  const poly = pts => { ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath(); };
+  const box = (x, y, w, h) => { ctx.beginPath(); ctx.rect(x, y, w, h); };
 
+  // ── 그림 조각: (0,0) 가운데에 크기 s 로 그린다 ──
+  const M = {
+    heart(s, c = C.red) { ctx.beginPath(); ctx.moveTo(0, s * 0.5); ctx.bezierCurveTo(-s, -s * 0.1, -s * 0.5, -s * 0.9, 0, -s * 0.3); ctx.bezierCurveTo(s * 0.5, -s * 0.9, s, -s * 0.1, 0, s * 0.5); fs(c, Math.max(1.5, s / 10)); },
+    star(s, c = C.gold) { poly([...Array(10)].map((_, i) => { const r = i % 2 ? s * 0.45 : s, a = -Math.PI / 2 + i * Math.PI / 5; return [Math.cos(a) * r, Math.sin(a) * r]; })); fs(c, Math.max(1.5, s / 10)); },
+    sparkle(s, c = C.gold) { poly([...Array(8)].map((_, i) => { const r = i % 2 ? s * 0.28 : s, a = -Math.PI / 2 + i * Math.PI / 4; return [Math.cos(a) * r, Math.sin(a) * r]; })); fs(c, Math.max(1.2, s / 10)); },
+    note(s, c = C.blue) { line(Math.max(2, s / 8)); ctx.beginPath(); ctx.moveTo(s * 0.15, s * 0.35); ctx.lineTo(s * 0.15, -s * 0.7); ctx.quadraticCurveTo(s * 0.55, -s * 0.55, s * 0.6, -s * 0.15); ctx.stroke(); ctx.beginPath(); ctx.ellipse(-s * 0.12, s * 0.4, s * 0.32, s * 0.22, -0.4, 0, 6.3); fs(c, Math.max(1.5, s / 10)); },
+    paw(s, c = C.ink) { ctx.fillStyle = c; ctx.beginPath(); ctx.ellipse(0, s * 0.25, s * 0.42, s * 0.34, 0, 0, 6.3); ctx.fill(); for (const [x, y] of [[-0.48, -0.18], [-0.18, -0.5], [0.18, -0.5], [0.48, -0.18]]) { ctx.beginPath(); ctx.arc(x * s, y * s, s * 0.17, 0, 6.3); ctx.fill(); } },
+    coin(s, c = C.gold) { ctx.beginPath(); ctx.arc(0, 0, s, 0, 6.3); fs(c, Math.max(1.5, s / 8)); ctx.beginPath(); ctx.arc(0, 0, s * 0.62, 0, 6.3); line(Math.max(1, s / 12)); ctx.stroke(); },
+    petal(s, c = C.pink) { ctx.beginPath(); ctx.ellipse(0, 0, s, s * 0.55, 0, 0, 6.3); fs(c, Math.max(1.2, s / 8)); },
+    leaf(s, c = C.green) { ctx.beginPath(); ctx.moveTo(-s, 0); ctx.quadraticCurveTo(0, -s * 0.85, s, 0); ctx.quadraticCurveTo(0, s * 0.85, -s, 0); fs(c, Math.max(1.4, s / 9)); ctx.beginPath(); ctx.moveTo(-s, 0); ctx.lineTo(s * 0.7, 0); ctx.stroke(); },
+    bubble(s) { ctx.beginPath(); ctx.arc(0, 0, s, 0, 6.3); ctx.fillStyle = "rgba(255,210,63,0.35)"; ctx.fill(); line(Math.max(1.2, s / 6)); ctx.stroke(); ctx.beginPath(); ctx.arc(-s * 0.35, -s * 0.35, s * 0.22, 0, 6.3); ctx.fillStyle = C.white; ctx.fill(); },
+    zzz(s, c = C.blue) { ctx.font = `${s}px Jua, sans-serif`; ctx.textAlign = "center"; ctx.textBaseline = "middle"; line(Math.max(2, s / 6)); ctx.strokeText("Z", 0, 0); ctx.fillStyle = c; ctx.fillText("Z", 0, 0); },
+    grain(s, c = C.white) { ctx.beginPath(); ctx.ellipse(0, 0, s * 0.5, s, 0, 0, 6.3); fs(c, Math.max(1.2, s / 6)); },
+    bean(s, c = C.brown) { ctx.beginPath(); ctx.ellipse(0, 0, s * 0.6, s * 0.85, 0, 0, 6.3); fs(c, Math.max(1.2, s / 8)); ctx.beginPath(); ctx.moveTo(0, -s * 0.7); ctx.quadraticCurveTo(-s * 0.25, 0, 0, s * 0.7); ctx.stroke(); },
+    popcorn(s, c = C.white) { ctx.beginPath(); for (const [x, y, r] of [[-0.35, 0.1, 0.5], [0.35, 0.1, 0.5], [0, -0.3, 0.55]]) { ctx.moveTo(x * s + r * s, y * s); ctx.arc(x * s, y * s, r * s, 0, 6.3); } fs(c, Math.max(1.2, s / 8)); },
+    // 소품용 큰 그림
+    tree(s) {
+      for (const [top, half, base] of [[-1, 0.5, -0.3], [-0.6, 0.65, 0.15], [-0.2, 0.8, 0.6]]) { poly([[0, top * s], [-half * s, base * s], [half * s, base * s]]); fs(C.green, s / 14); }
+      box(-s * 0.12, s * 0.6, s * 0.24, s * 0.3); fs(C.brown, s / 14);
+      for (const [x, y, c] of [[-0.3, 0.42, C.red], [0.32, 0.38, C.blue], [0.05, 0.02, C.orange], [-0.2, -0.15, C.red]]) { ctx.beginPath(); ctx.arc(x * s, y * s, s * 0.08, 0, 6.3); fs(c, s / 20); }
+      ctx.save(); ctx.translate(0, -s); M.star(s * 0.26, C.gold); ctx.restore();
+    },
+    cake(s) {
+      box(-s * 0.7, -s * 0.05, s * 1.4, s * 0.65); fs(C.pink, s / 14);
+      ctx.beginPath(); ctx.moveTo(-s * 0.7, -s * 0.3); ctx.lineTo(s * 0.7, -s * 0.3); ctx.lineTo(s * 0.7, -s * 0.05);
+      for (let i = 0; i < 5; i++) ctx.quadraticCurveTo(s * (0.56 - i * 0.28), s * 0.15, s * (0.42 - i * 0.28), -s * 0.05);
+      ctx.closePath(); fs(C.white, s / 14);
+      box(-s * 0.07, -s * 0.75, s * 0.14, s * 0.45); fs(C.orange, s / 16);
+      ctx.beginPath(); ctx.ellipse(0, -s * 0.9, s * 0.1, s * 0.16, 0, 0, 6.3); fs(C.gold, s / 20);
+    },
+    cup(s) {
+      poly([[-s * 0.6, -s * 0.2], [s * 0.5, -s * 0.2], [s * 0.4, s * 0.6], [-s * 0.5, s * 0.6]]); fs(C.white, s / 12);
+      ctx.beginPath(); ctx.arc(s * 0.55, s * 0.15, s * 0.22, -Math.PI / 2, Math.PI / 2); ctx.stroke();
+      ctx.beginPath(); ctx.ellipse(-s * 0.05, -s * 0.2, s * 0.55, s * 0.12, 0, 0, 6.3); fs(C.brown, s / 14);
+      line(s / 12); for (const x of [-0.25, 0.15]) { ctx.beginPath(); ctx.moveTo(x * s, -s * 0.42); ctx.bezierCurveTo((x - 0.15) * s, -s * 0.6, (x + 0.15) * s, -s * 0.75, x * s, -s * 0.95); ctx.stroke(); }
+    },
+    catFace(s) {
+      for (const k of [-1, 1]) { poly([[k * s * 0.72, -s * 0.15], [k * s * 0.58, -s * 0.95], [k * s * 0.15, -s * 0.55]]); fs(C.orange, s / 14); }
+      ctx.beginPath(); ctx.arc(0, 0, s * 0.75, 0, 6.3); fs(C.orange, s / 14);
+      ctx.fillStyle = C.ink; for (const k of [-1, 1]) { ctx.beginPath(); ctx.arc(k * s * 0.28, -s * 0.08, s * 0.08, 0, 6.3); ctx.fill(); }
+      poly([[-s * 0.08, s * 0.12], [s * 0.08, s * 0.12], [0, s * 0.22]]); fs(C.pink, s / 20);
+      line(s / 22); for (const k of [-1, 1]) for (const dy of [0.18, 0.3]) { ctx.beginPath(); ctx.moveTo(k * s * 0.25, s * dy); ctx.lineTo(k * s * 0.85, s * (dy - 0.06)); ctx.stroke(); }
+    },
+    bone(s) {
+      for (const [x, y] of [[-0.62, -0.2], [-0.62, 0.2], [0.62, -0.2], [0.62, 0.2]]) { ctx.beginPath(); ctx.arc(x * s, y * s, s * 0.26, 0, 6.3); fs(C.white, s / 14); }
+      box(-s * 0.62, -s * 0.2, s * 1.24, s * 0.4); ctx.fillStyle = C.white; ctx.fill();
+      line(s / 14); ctx.beginPath(); ctx.moveTo(-s * 0.4, -s * 0.2); ctx.lineTo(s * 0.4, -s * 0.2); ctx.moveTo(-s * 0.4, s * 0.2); ctx.lineTo(s * 0.4, s * 0.2); ctx.stroke();
+    },
+    bowl(s) {
+      line(s / 12); ctx.beginPath(); ctx.moveTo(s * 0.15, -s * 0.95); ctx.lineTo(s * 0.55, -s * 0.05); ctx.moveTo(s * 0.35, -s * 0.95); ctx.lineTo(s * 0.7, -s * 0.1); ctx.stroke();
+      ctx.beginPath(); ctx.arc(0, -s * 0.05, s * 0.65, Math.PI, 0); fs(C.white, s / 14);
+      ctx.beginPath(); ctx.arc(0, -s * 0.05, s * 0.85, 0, Math.PI); ctx.closePath(); fs(C.orange, s / 14);
+    },
+    moon(s) {
+      ctx.beginPath(); ctx.arc(0, 0, s * 0.8, 0, 6.3); fs(C.gold, s / 14);
+      ctx.save(); ctx.beginPath(); ctx.arc(0, 0, s * 0.8, 0, 6.3); ctx.clip();
+      ctx.beginPath(); ctx.arc(s * 0.4, -s * 0.3, s * 0.7, 0, 6.3); ctx.fillStyle = C.white; ctx.fill(); line(s / 14); ctx.stroke(); ctx.restore();
+      ctx.save(); ctx.translate(s * 0.55, -s * 0.55); M.zzz(s * 0.45); ctx.restore();
+    },
+    pencil(s) {
+      ctx.save(); ctx.rotate(-0.7);
+      box(-s * 0.8, -s * 0.18, s * 1.3, s * 0.36); fs(C.gold, s / 14);
+      poly([[s * 0.5, -s * 0.18], [s * 0.88, 0], [s * 0.5, s * 0.18]]); fs(C.tan, s / 14);
+      poly([[s * 0.76, -s * 0.06], [s * 0.88, 0], [s * 0.76, s * 0.06]]); fs(C.ink, 1);
+      box(-s * 1.0, -s * 0.18, s * 0.2, s * 0.36); fs(C.pink, s / 14);
+      ctx.restore();
+    },
+    plane(s) {
+      poly([[-s * 0.1, 0], [s * 0.25, 0], [-s * 0.25, s * 0.7], [-s * 0.45, s * 0.7]]); fs(C.blue, s / 14);
+      poly([[-s * 0.1, 0], [s * 0.25, 0], [-s * 0.25, -s * 0.7], [-s * 0.45, -s * 0.7]]); fs(C.blue, s / 14);
+      poly([[-s * 0.85, 0], [-s * 0.65, 0], [-s * 0.95, -s * 0.4], [-s * 1.05, -s * 0.4]]); fs(C.orange, s / 14);
+      ctx.beginPath(); ctx.ellipse(0, 0, s, s * 0.2, 0, 0, 6.3); fs(C.white, s / 14);
+      ctx.fillStyle = C.ink; for (const x of [0.2, 0.4, 0.6]) { ctx.beginPath(); ctx.arc(x * s, -s * 0.03, s * 0.05, 0, 6.3); ctx.fill(); }
+    },
+    flower(s) {
+      for (let i = 0; i < 5; i++) { ctx.save(); ctx.rotate(i * 2 * Math.PI / 5); ctx.translate(0, -s * 0.5); M.petal(s * 0.42, C.pink); ctx.restore(); }
+      ctx.beginPath(); ctx.arc(0, 0, s * 0.28, 0, 6.3); fs(C.gold, s / 14);
+    },
+    dumbbell(s) {
+      line(s * 0.14); ctx.beginPath(); ctx.moveTo(-s * 0.8, 0); ctx.lineTo(s * 0.8, 0); ctx.stroke();
+      for (const k of [-1, 1]) { box(k * s * 0.6 - s * 0.12, -s * 0.45, s * 0.24, s * 0.9); fs(C.blue, s / 14); box(k * s * 0.86 - s * 0.08, -s * 0.3, s * 0.16, s * 0.6); fs(C.blue, s / 14); }
+    },
+    mug(s) {
+      ctx.beginPath(); ctx.arc(s * 0.45, s * 0.1, s * 0.25, -Math.PI / 2, Math.PI / 2); line(s / 10); ctx.stroke();
+      box(-s * 0.5, -s * 0.4, s * 0.9, s * 1.0); fs(C.gold, s / 14);
+      for (const [x, r] of [[-0.35, 0.22], [0, 0.26], [0.3, 0.22]]) { ctx.beginPath(); ctx.arc(x * s, -s * 0.45, r * s, 0, 6.3); fs(C.white, s / 16); }
+    },
+    umbrella(s) {
+      line(s / 12); ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, s * 0.7); ctx.arc(-s * 0.15, s * 0.7, s * 0.15, 0, Math.PI); ctx.stroke();
+      ctx.beginPath(); ctx.arc(0, 0, s, Math.PI, 0); for (let i = 0; i < 4; i++) ctx.arc(s * (0.75 - i * 0.5), 0, s * 0.25, 0, Math.PI, true); ctx.closePath(); fs(C.blue, s / 14);
+    },
+    snowflake(s) {
+      for (const [w, c] of [[s / 5, C.ink], [s / 10, C.white]]) {
+        ctx.strokeStyle = c; ctx.lineWidth = w; ctx.lineCap = "round";
+        for (let i = 0; i < 6; i++) { ctx.save(); ctx.rotate(i * Math.PI / 3); ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -s); ctx.moveTo(0, -s * 0.55); ctx.lineTo(-s * 0.22, -s * 0.78); ctx.moveTo(0, -s * 0.55); ctx.lineTo(s * 0.22, -s * 0.78); ctx.stroke(); ctx.restore(); }
+      }
+    },
+    bolt(s) { poly([[s * 0.2, -s], [-s * 0.45, s * 0.1], [0, s * 0.1], [-s * 0.2, s], [s * 0.45, -s * 0.1], [0, -s * 0.1]]); fs(C.gold, s / 12); },
+    mask(s) {
+      line(s / 14); for (const k of [-1, 1]) { ctx.beginPath(); ctx.ellipse(k * s * 0.75, 0, s * 0.18, s * 0.3, 0, 0, 6.3); ctx.stroke(); }
+      box(-s * 0.7, -s * 0.38, s * 1.4, s * 0.76); fs(C.white, s / 14);
+      for (const y of [-0.12, 0.12]) { ctx.beginPath(); ctx.moveTo(-s * 0.5, y * s); ctx.lineTo(s * 0.5, y * s); ctx.stroke(); }
+    },
+    sunIcon(s) {
+      line(s / 10); for (let i = 0; i < 12; i++) { const a = i * Math.PI / 6; ctx.beginPath(); ctx.moveTo(Math.cos(a) * s * 0.75, Math.sin(a) * s * 0.75); ctx.lineTo(Math.cos(a) * s, Math.sin(a) * s); ctx.stroke(); }
+      ctx.beginPath(); ctx.arc(0, 0, s * 0.58, 0, 6.3); fs(C.orange, s / 14);
+      ctx.fillStyle = C.ink; for (const k of [-1, 1]) { ctx.beginPath(); ctx.arc(k * s * 0.2, -s * 0.08, s * 0.06, 0, 6.3); ctx.fill(); }
+      ctx.beginPath(); ctx.arc(0, s * 0.06, s * 0.2, 0.15 * Math.PI, 0.85 * Math.PI); line(s / 14); ctx.stroke();
+    },
+    cloudIcon(s) { const k = s / 50; cloudShape(-34 * k, 12 * k, k); },
+    popper(s) {
+      poly([[-s * 0.8, s * 0.8], [-s * 0.05, -s * 0.35], [s * 0.35, s * 0.05]]); fs(C.orange, s / 14);
+      line(s / 16); ctx.beginPath(); ctx.moveTo(-s * 0.45, s * 0.25); ctx.lineTo(-s * 0.2, s * 0.5); ctx.moveTo(-s * 0.3, -s * 0.02); ctx.lineTo(s * 0.05, s * 0.3); ctx.stroke();
+    },
+    clock(s) {
+      for (const k of [-1, 1]) { ctx.beginPath(); ctx.arc(k * s * 0.74, -s * 0.83, s * 0.35, 0, 6.3); fs(C.orange, s / 16); }
+      ctx.beginPath(); ctx.arc(0, 0, s, 0, 6.3); fs(C.white, s / 12);
+      line(s / 12); ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -s * 0.6); ctx.moveTo(0, 0); ctx.lineTo(s * 0.43, s * 0.17); ctx.stroke();
+      ctx.beginPath(); ctx.arc(0, 0, s * 0.1, 0, 6.3); ctx.fillStyle = C.ink; ctx.fill();
+    },
+  };
+  function cloudShape(x, y, k) {
+    ctx.beginPath();
+    ctx.arc(x, y, 26 * k, Math.PI * 0.5, Math.PI * 1.5);
+    ctx.arc(x + 30 * k, y - 22 * k, 30 * k, Math.PI, Math.PI * 2);
+    ctx.arc(x + 66 * k, y - 8 * k, 22 * k, Math.PI * 1.3, Math.PI * 0.5);
+    ctx.closePath(); fs(C.white, Math.max(1.5, 2 * k));
+  }
+  function motif(name, x, y, s, c, rot = 0, alpha = 1) {
+    ctx.save(); ctx.globalAlpha *= alpha; ctx.translate(x, y); ctx.rotate(rot); M[name](s, c); ctx.restore();
+  }
+
+  // ── 배경 장면: 기존 날씨·생활 효과 ──
+  const BASE = {
+    rain: {n: 150, make: () => ({x: rnd(-60, W), y: rnd(-H * 0.2, H), v: rnd(9, 15), l: rnd(12, 22)}),
+      draw() { ctx.fillStyle = "rgba(91,95,214,0.07)"; ctx.fillRect(0, 0, W, H); drops(C.blue, 2); }},
+    storm: {n: 210, make: () => ({x: rnd(-80, W), y: rnd(-H * 0.2, H), v: rnd(13, 19), l: rnd(16, 26)}),
+      draw(el) {
+        ctx.fillStyle = "rgba(17,17,17,0.12)"; ctx.fillRect(0, 0, W, H); drops(C.blue, 2.2);
+        const n = Math.floor(el / 1500);
+        if (n !== S.boltAt && el % 1500 < 60) {
+          S.boltAt = n; let x = rnd(W * 0.2, W * 0.8), y = 0; S.bolt = {pts: [[x, y]], life: 1};
+          while (y < H * 0.6) { x += rnd(-30, 30); y += rnd(30, 60); S.bolt.pts.push([x, y]); }
+        }
+        if (S.bolt && S.bolt.life > 0.02) {
+          ctx.fillStyle = `rgba(255,255,255,${0.55 * S.bolt.life})`; ctx.fillRect(0, 0, W, H);
+          ctx.beginPath(); S.bolt.pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+          ctx.strokeStyle = C.ink; ctx.lineWidth = 7; ctx.stroke(); ctx.strokeStyle = C.gold; ctx.lineWidth = 3.5; ctx.stroke();
+          S.bolt.life *= Math.pow(0.86, dt);
+        }
+      }},
+    snow: {n: 90, make: () => ({x: rnd(0, W), y: rnd(-H * 0.1, H), v: rnd(0.8, 1.8), r: rnd(3, 7), p: rnd(0, 6.3)}),
+      draw(el) {
+        for (const p of S.parts) {
+          p.y += p.v * dt; p.x += Math.sin(el / 600 + p.p) * 0.6 * dt;
+          if (p.y > H + 10) { p.y = -10; p.x = rnd(0, W); }
+          ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.3); fs(C.white, 1.5);
+        }
+      }},
+    sun: {n: 0, draw(el) {
+      const x = W - 96, y = 96, g = ctx.createRadialGradient(x, y, 20, x, y, Math.max(W, H));
+      g.addColorStop(0, "rgba(255,138,43,0.30)"); g.addColorStop(1, "rgba(255,138,43,0)");
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+      ctx.save(); ctx.translate(x, y); ctx.rotate(el / 1800); M.sunIcon(72); ctx.restore();
+    }},
+    cloud: {n: 6, make: () => ({x: rnd(-W * 0.4, W), y: rnd(20, H * 0.45), v: rnd(0.4, 0.9), k: rnd(0.7, 1.3)}),
+      draw() { for (const p of S.parts) { p.x += p.v * dt; if (p.x > W + 20) p.x = -110 * p.k; cloudShape(p.x, p.y, p.k); } }},
+    fog: {n: 7, make: () => ({x: rnd(-W, W), y: rnd(0, H), v: rnd(0.3, 0.7), w: rnd(W * 0.5, W), h: rnd(40, 90)}),
+      draw() {
+        ctx.fillStyle = "rgba(255,255,255,0.18)"; ctx.fillRect(0, 0, W, H);
+        for (const p of S.parts) { p.x += p.v * dt; if (p.x > W) p.x = -p.w; ctx.beginPath(); ctx.ellipse(p.x + p.w / 2, p.y, p.w / 2, p.h / 2, 0, 0, 6.3); ctx.fillStyle = "rgba(255,255,255,0.45)"; ctx.fill(); }
+      }},
+    dust: {n: 170, make: () => ({x: rnd(0, W), y: rnd(0, H), vx: rnd(0.2, 0.9), vy: rnd(-0.25, 0.25), r: rnd(1.5, 4)}),
+      draw() {
+        ctx.fillStyle = `rgba(150,128,96,${0.08 + 0.2 * S.level})`; ctx.fillRect(0, 0, W, H); ctx.fillStyle = "rgba(90,78,60,0.55)";
+        for (const p of S.parts) { p.x += p.vx * dt; p.y += p.vy * dt; if (p.x > W + 5) p.x = -5; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.3); ctx.fill(); }
+      }},
+    alarm: {n: 0, draw(el) {
+      const x = W / 2, y = 120, ring = (el % 900) / 900;
+      for (const k of [ring, (ring + 0.5) % 1]) { ctx.beginPath(); ctx.arc(x, y, 56 + k * 120, 0, 6.3); ctx.strokeStyle = `rgba(255,138,43,${1 - k})`; ctx.lineWidth = 4; ctx.stroke(); }
+      ctx.save(); ctx.translate(x, y); ctx.rotate(el < 2600 ? Math.sin(el / 45) * 0.22 : 0); M.clock(46); ctx.restore();
+    }},
+  };
   function drops(color, width) {
     ctx.strokeStyle = color; ctx.lineWidth = width; ctx.lineCap = "round"; ctx.beginPath();
-    for (const p of parts) {
+    for (const p of S.parts) {
       p.y += p.v * dt; p.x += p.v * 0.25 * dt;
       if (p.y > H + 30) { p.y = rnd(-40, 0); p.x = rnd(-60, W); }
       ctx.moveTo(p.x, p.y); ctx.lineTo(p.x - p.l * 0.25, p.y - p.l);
     }
     ctx.stroke();
   }
-  function cloudShape(x, y, k) {
-    ctx.beginPath();
-    ctx.arc(x, y, 26 * k, Math.PI * 0.5, Math.PI * 1.5);
-    ctx.arc(x + 30 * k, y - 22 * k, 30 * k, Math.PI, Math.PI * 2);
-    ctx.arc(x + 66 * k, y - 8 * k, 22 * k, Math.PI * 1.3, Math.PI * 0.5);
-    ctx.closePath(); ctx.fillStyle = C.white; ctx.fill(); outline(2); ctx.stroke();
-  }
-  const draw = {
-    rain() { ctx.fillStyle = "rgba(91,95,214,0.07)"; ctx.fillRect(0, 0, W, H); drops(C.blue, 2); },
-    storm(el) {
-      ctx.fillStyle = "rgba(17,17,17,0.12)"; ctx.fillRect(0, 0, W, H); drops(C.blue, 2.2);
-      const n = Math.floor(el / 1500);
-      if (n !== boltAt && el % 1500 < 60) {
-        boltAt = n; let x = rnd(W * 0.2, W * 0.8), y = 0; bolt = {pts: [[x, y]], life: 1};
-        while (y < H * 0.6) { x += rnd(-30, 30); y += rnd(30, 60); bolt.pts.push([x, y]); }
-      }
-      if (bolt && bolt.life > 0.02) {
-        ctx.fillStyle = `rgba(255,255,255,${0.55 * bolt.life})`; ctx.fillRect(0, 0, W, H);
-        ctx.beginPath(); bolt.pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
-        ctx.strokeStyle = C.ink; ctx.lineWidth = 7; ctx.stroke(); ctx.strokeStyle = "#FFD23F"; ctx.lineWidth = 3.5; ctx.stroke();
-        bolt.life *= Math.pow(0.86, dt);
-      }
-    },
-    snow(el) {
-      for (const p of parts) {
-        p.y += p.v * dt; p.x += Math.sin(el / 600 + p.p) * 0.6 * dt;
-        if (p.y > H + 10) { p.y = -10; p.x = rnd(0, W); }
-        ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.3); ctx.fillStyle = C.white; ctx.fill(); outline(1.5); ctx.stroke();
-      }
-    },
-    sun(el) {
-      const x = W - 96, y = 96, g = ctx.createRadialGradient(x, y, 20, x, y, Math.max(W, H));
-      g.addColorStop(0, "rgba(255,138,43,0.30)"); g.addColorStop(1, "rgba(255,138,43,0)");
-      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
-      ctx.save(); ctx.translate(x, y); ctx.rotate(el / 1800);
-      outline(4); ctx.lineCap = "round";
-      for (let i = 0; i < 12; i++) { ctx.rotate(Math.PI / 6); ctx.beginPath(); ctx.moveTo(0, 54); ctx.lineTo(0, 54 + 18 + 8 * Math.sin(el / 200 + i)); ctx.stroke(); }
-      ctx.restore();
-      ctx.beginPath(); ctx.arc(x, y, 44, 0, 6.3); ctx.fillStyle = C.orange; ctx.fill(); outline(3); ctx.stroke();
-      ctx.fillStyle = C.ink; ctx.beginPath(); ctx.arc(x - 14, y - 6, 4, 0, 6.3); ctx.arc(x + 14, y - 6, 4, 0, 6.3); ctx.fill();
-      ctx.beginPath(); ctx.arc(x, y + 6, 14, 0.15 * Math.PI, 0.85 * Math.PI); outline(3); ctx.stroke();
-    },
-    cloud() {
-      for (const p of parts) { p.x += p.v * dt; if (p.x > W + 20) p.x = -110 * p.k; cloudShape(p.x, p.y, p.k); }
-    },
-    fog() {
-      ctx.fillStyle = "rgba(255,255,255,0.18)"; ctx.fillRect(0, 0, W, H);
-      for (const p of parts) {
-        p.x += p.v * dt; if (p.x > W) p.x = -p.w;
-        ctx.beginPath(); ctx.ellipse(p.x + p.w / 2, p.y, p.w / 2, p.h / 2, 0, 0, 6.3); ctx.fillStyle = "rgba(255,255,255,0.45)"; ctx.fill();
-      }
-    },
-    dust() {
-      ctx.fillStyle = `rgba(150,128,96,${0.08 + 0.2 * level})`; ctx.fillRect(0, 0, W, H);
-      ctx.fillStyle = "rgba(90,78,60,0.55)";
-      for (const p of parts) {
-        p.x += p.vx * dt; p.y += p.vy * dt; if (p.x > W + 5) p.x = -5;
-        ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.3); ctx.fill();
-      }
-    },
-    fresh(el) {
-      ctx.fillStyle = "rgba(95,209,63,0.08)"; ctx.fillRect(0, 0, W, H);
-      for (const p of parts) {
-        p.y -= p.v * dt; p.a += p.s * dt; p.x += Math.sin(el / 500 + p.p) * 0.7 * dt;
-        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.a);
-        ctx.beginPath(); ctx.moveTo(-14, 0); ctx.quadraticCurveTo(0, -12, 14, 0); ctx.quadraticCurveTo(0, 12, -14, 0);
-        ctx.fillStyle = C.green; ctx.fill(); outline(1.6); ctx.stroke();
-        ctx.beginPath(); ctx.moveTo(-14, 0); ctx.lineTo(10, 0); ctx.stroke(); ctx.restore();
-      }
-    },
-    confetti(el) {
-      for (const p of parts) {
-        p.y += p.v * dt; p.a += p.s * dt; p.x += Math.sin(el / 400 + p.p) * 0.8 * dt;
-        if (p.y > H + 20 && el < DUR * 0.6) { p.y = -20; p.x = rnd(0, W); }
-        ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.a); ctx.fillStyle = p.c;
-        ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h * Math.abs(Math.cos(el / 300 + p.p))); ctx.restore();
-      }
-    },
-    alarm(el) {
-      const x = W / 2, y = 120, ring = (el % 900) / 900;
-      for (const k of [ring, (ring + 0.5) % 1]) {
-        ctx.beginPath(); ctx.arc(x, y, 56 + k * 120, 0, 6.3); ctx.strokeStyle = `rgba(255,138,43,${1 - k})`; ctx.lineWidth = 4; ctx.stroke();
-      }
-      ctx.save(); ctx.translate(x, y); ctx.rotate(el < 2600 ? Math.sin(el / 45) * 0.22 : 0);
-      for (const s of [-1, 1]) { ctx.beginPath(); ctx.arc(s * 34, -38, 16, 0, 6.3); ctx.fillStyle = C.orange; ctx.fill(); outline(3); ctx.stroke(); }
-      ctx.beginPath(); ctx.arc(0, 0, 46, 0, 6.3); ctx.fillStyle = C.white; ctx.fill(); outline(4); ctx.stroke();
-      ctx.lineCap = "round"; outline(4); ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(0, -28); ctx.moveTo(0, 0); ctx.lineTo(20, 8); ctx.stroke();
-      ctx.beginPath(); ctx.arc(0, 0, 5, 0, 6.3); ctx.fillStyle = C.ink; ctx.fill();
-      ctx.restore();
-    },
-  };
 
+  // ── 배경 장면: 주제별 조합 (움직임 + 그림 조각 + 색 + 배경 물감) ──
+  const THEME = {
+    christmas: {base: "snow", tint: "rgba(47,143,31,0.07)", extra: {motion: "twinkle", motif: "star", colors: [C.gold], n: 14, size: [6, 11]}},
+    birthday: {motion: "fall", motif: "petal", colors: [C.green, C.orange, C.blue, C.pink], n: 120, size: [5, 8], spin: true, extra: {motion: "rise", motif: "bubble", colors: [C.white], n: 10, size: [10, 18]}},
+    confetti: {motion: "fall", motif: "petal", colors: [C.green, C.orange, C.blue, C.ink], n: 130, size: [5, 8], spin: true},
+    love: {motion: "rise", motif: "heart", colors: [C.red, C.pink], n: 26, size: [10, 20], tint: "rgba(255,143,177,0.10)"},
+    comfort: {motion: "rise", motif: "heart", colors: [C.pink, "#FFC2D4"], n: 14, size: [8, 14], speed: 0.5, tint: "rgba(127,214,245,0.12)"},
+    coffee: {motion: "fall", motif: "bean", colors: [C.brown], n: 34, size: [6, 10], spin: true, tint: "rgba(154,91,43,0.07)"},
+    cat: {motion: "walk", motif: "paw", colors: [C.ink], n: 12, size: [11, 14]},
+    dog: {motion: "walk", motif: "paw", colors: [C.brown], n: 12, size: [12, 15]},
+    food: {motion: "fall", motif: "grain", colors: [C.white], n: 60, size: [3, 5], spin: true, tint: "rgba(255,138,43,0.08)"},
+    sleep: {motion: "rise", motif: "zzz", colors: [C.blue, C.sky], n: 12, size: [16, 30], speed: 0.6, tint: "rgba(17,17,60,0.16)", extra: {motion: "twinkle", motif: "sparkle", colors: [C.gold], n: 18, size: [4, 8]}},
+    study: {motion: "twinkle", motif: "sparkle", colors: [C.gold, C.green], n: 30, size: [6, 12]},
+    cheer: {motion: "burst", motif: "star", colors: [C.gold, C.orange, C.green], n: 40, size: [7, 13]},
+    travel: {base: "cloud", tint: "rgba(127,214,245,0.14)", extra: {motion: "drift", motif: "plane", colors: [C.white], n: 1, size: [26, 26]}},
+    music: {motion: "drift", motif: "note", colors: [C.blue, C.green, C.orange], n: 20, size: [14, 22]},
+    flower: {motion: "fall", motif: "petal", colors: [C.pink, "#FFC2D4"], n: 60, size: [6, 10], spin: true},
+    fresh: {motion: "rise", motif: "leaf", colors: [C.green], n: 26, size: [10, 14], tint: "rgba(95,209,63,0.08)"},
+    autumn: {motion: "fall", motif: "leaf", colors: [C.orange, C.red, "#F5B700"], n: 40, size: [10, 16], spin: true},
+    money: {motion: "fall", motif: "coin", colors: [C.gold], n: 36, size: [9, 14], spin: true},
+    exercise: {motion: "burst", motif: "sparkle", colors: [C.green, C.blue], n: 30, size: [6, 11], extra: {motion: "rise", motif: "leaf", colors: [C.green], n: 10, size: [9, 12]}},
+    movie: {motion: "fall", motif: "popcorn", colors: [C.white], n: 30, size: [8, 12], spin: true, tint: "rgba(17,17,17,0.10)"},
+    party: {motion: "rise", motif: "bubble", colors: [C.white], n: 40, size: [4, 10], tint: "rgba(255,210,63,0.10)"},
+  };
+  function makeParts(t) {
+    if (t.motion === "walk") {
+      const n = t.n; return Array.from({length: n}, (_, i) => ({
+        x: W * 0.12 + i * (W * 0.76 / n) + (i % 2 ? 10 : -10), y: H * 0.85 - i * (H * 0.62 / n) + (i % 2 ? 12 : -12),
+        s: rnd(...t.size), c: any(t.colors), a: -0.7, at: i * 230}));
+    }
+    return Array.from({length: t.n}, () => {
+      const s = rnd(...t.size), c = any(t.colors), p = rnd(0, 6.3), a = rnd(0, 6.3), v = rnd(0.9, 2.2) * (t.speed || 1);
+      if (t.motion === "fall") return {x: rnd(0, W), y: rnd(-H * 0.4, H), v, s, c, p, a, spin: t.spin ? rnd(-0.05, 0.05) : 0};
+      if (t.motion === "rise") return {x: rnd(0, W), y: rnd(H * 0.2, H * 1.3), v, s, c, p, a: rnd(-0.3, 0.3), spin: 0};
+      if (t.motion === "drift") return {x: rnd(-W * 0.3, W), y: rnd(H * 0.1, H * 0.75), v: v * 0.9, s, c, p, a: 0, spin: 0};
+      if (t.motion === "twinkle") return {x: rnd(0, W), y: rnd(0, H * 0.85), s, c, p, a: rnd(-0.3, 0.3)};
+      const ang = rnd(0, 6.3), sp = rnd(3, 9);   // burst
+      return {x: W / 2, y: H * 0.38, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp - 3, s, c, p, a, spin: rnd(-0.1, 0.1)};
+    });
+  }
+  function drawParts(t, parts, el) {
+    const keep = el < SCENE_MS * 0.7;
+    for (const q of parts) {
+      if (t.motion === "fall") { q.y += q.v * dt; q.x += Math.sin(el / 500 + q.p) * 0.7 * dt; q.a += q.spin * dt; if (q.y > H + 20 && keep) { q.y = -20; q.x = rnd(0, W); } }
+      else if (t.motion === "rise") { q.y -= q.v * dt; q.x += Math.sin(el / 600 + q.p) * 0.6 * dt; if (q.y < -30 && keep) { q.y = H + 20; q.x = rnd(0, W); } }
+      else if (t.motion === "drift") { q.x += q.v * dt; q.y += Math.sin(el / 500 + q.p) * 0.6 * dt; if (q.x > W + 40) q.x = -40; }
+      else if (t.motion === "burst") { q.x += q.vx * dt; q.y += q.vy * dt; q.vy += 0.15 * dt; q.vx *= Math.pow(0.99, dt); q.a += q.spin * dt; }
+      if (t.motion === "walk") {
+        const age = el - q.at; if (age < 0) continue;
+        motif(t.motif, q.x, q.y, q.s, q.c, q.a, Math.min(1, age / 200) * (age > 2600 ? Math.max(0, 1 - (age - 2600) / 600) : 1));
+      } else if (t.motion === "twinkle") {
+        motif(t.motif, q.x, q.y, q.s * (0.6 + 0.4 * Math.sin(el / 280 + q.p)), q.c, q.a);
+      } else motif(t.motif, q.x, q.y, q.s, q.c, q.a);
+    }
+  }
+
+  function drawScene(el) {
+    const t = THEME[S.kind];
+    if (t?.tint) { ctx.fillStyle = t.tint; ctx.fillRect(0, 0, W, H); }
+    if (BASE[S.kind]) BASE[S.kind].draw(el);
+    else if (t.base) BASE[t.base].draw(el);
+    else drawParts(t, S.parts, el);
+    if (t?.extra) drawParts(t.extra, S.extra, el);
+  }
+
+  // ── 포인트 소품: 흰 스티커 위에 큰 그림이 통통 튀어나오고 작은 조각이 퍼진다 ──
+  const ICON = {christmas: "tree", birthday: "cake", love: "heart", comfort: "heart", coffee: "cup", cat: "catFace", dog: "bone",
+    food: "bowl", sleep: "moon", study: "pencil", cheer: "star", travel: "plane", music: "note", flower: "flower", fresh: "leaf",
+    autumn: "leaf", money: "coin", exercise: "dumbbell", movie: "popcorn", party: "mug", sun: "sunIcon", cloud: "cloudIcon",
+    fog: "cloudIcon", rain: "umbrella", snow: "snowflake", storm: "bolt", dust: "mask", confetti: "popper", alarm: "clock"};
+  const ICON_COLOR = {love: C.red, comfort: C.pink, autumn: C.orange, fresh: C.green, music: C.blue, cheer: C.gold, money: C.gold, movie: C.white};
+  const MINI = {christmas: ["star", C.gold], birthday: ["sparkle", C.orange], love: ["heart", C.red], comfort: ["heart", C.pink],
+    coffee: ["bean", C.brown], cat: ["paw", C.ink], dog: ["paw", C.brown], music: ["note", C.blue], flower: ["petal", C.pink],
+    autumn: ["leaf", C.orange], fresh: ["leaf", C.green], money: ["coin", C.gold], movie: ["popcorn", C.white], party: ["bubble", C.white],
+    snow: ["snowflake", C.white], rain: ["grain", C.sky], sleep: ["sparkle", C.gold]};
+
+  function drawProp(el) {
+    const x = W / 2, y = Math.min(H * 0.32, 170), s = Math.min(54, W * 0.12);
+    const k = el < 450 ? 1 - Math.pow(1 - el / 450, 3) * Math.cos(el / 450 * Math.PI * 1.5) : 1;   // 통통 튀어나오기
+    const bob = el > 450 ? Math.sin((el - 450) / 380) * 6 : 0;
+    for (const q of P.minis) {
+      q.x += q.vx * dt; q.y += q.vy * dt; q.vy += 0.12 * dt; q.a += q.spin * dt;
+      motif(q.m, x + q.x, y + q.y, q.s, q.c, q.a, Math.max(0, 1 - el / 2600));
+    }
+    ctx.save(); ctx.translate(x, y + bob); ctx.scale(k, k); ctx.rotate(-0.05);
+    ctx.beginPath(); ctx.arc(0, 0, s * 1.35, 0, 6.3); fs(C.white, 3);
+    M[ICON[P.kind]](s, ICON_COLOR[P.kind]);
+    ctx.restore();
+  }
+
+  // ── 재생 ──
   function frame(now) {
-    const el = now - t0;
-    if (el > DUR) return stop();
-    // 그리는 횟수가 적은 기기에서도 같은 속도로 움직이게, 지난 그림 뒤 흐른 시간만큼 움직인다(최대 3배)
     dt = Math.min(3, (now - last) / 16.7); last = now;
     ctx.clearRect(0, 0, W, H);
-    ctx.globalAlpha = el > DUR - FADE ? (DUR - el) / FADE : Math.min(1, el / 300);
-    draw[kind](el);
+    let alive = false;
+    if (S) {
+      const el = now - S.t0;
+      if (el > SCENE_MS) S = null;
+      else { alive = true; ctx.globalAlpha = el > SCENE_MS - FADE ? (SCENE_MS - el) / FADE : Math.min(1, el / 300); drawScene(el); }
+    }
+    if (P) {
+      const el = now - P.t0;
+      if (el > PROP_MS) P = null;
+      else { alive = true; ctx.globalAlpha = el > PROP_MS - 700 ? (PROP_MS - el) / 700 : 1; drawProp(el); }
+    }
     ctx.globalAlpha = 1;
-    raf = requestAnimationFrame(frame);
+    if (alive) raf = requestAnimationFrame(frame); else stop();
   }
-  function stop() { cancelAnimationFrame(raf); ctx.clearRect(0, 0, W, H); canvas.hidden = true; kind = null; }
-  function play(name, lvl = 0.6) {
-    if (!draw[name] || reduce.matches || $("#view-chat").hidden) return;
-    stop(); kind = name; level = Math.min(1, Math.max(0, Number(lvl) || 0.6)); bolt = null; boltAt = -1;
+  function start() {
     canvas.hidden = false; size();
-    parts = make[name] ? Array.from({length: Math.round(COUNT[name] * (0.45 + 0.55 * level))}, make[name]) : [];
-    t0 = last = performance.now(); raf = requestAnimationFrame(frame);
+    if (!raf) { last = performance.now(); raf = requestAnimationFrame(frame); }
   }
-  addEventListener("resize", () => { if (kind) size(); });
-  return {play, stop};
+  function ok() { return !reduce.matches && !$("#view-chat").hidden; }
+  function stop() { cancelAnimationFrame(raf); raf = 0; S = P = null; ctx.clearRect(0, 0, W, H); canvas.hidden = true; }
+
+  function play(name, level = 0.6) {
+    if (!ok() || !(BASE[name] || THEME[name])) return;
+    start();
+    const t = THEME[name], base = BASE[name] || (t?.base && BASE[t.base]);
+    S = {kind: name, t0: performance.now(), level: Math.min(1, Math.max(0, Number(level) || 0.6)), bolt: null, boltAt: -1,
+         parts: base ? (base.make ? Array.from({length: Math.round(base.n * (0.45 + 0.55 * (Number(level) || 0.6)))}, base.make) : []) : makeParts(t),
+         extra: t?.extra ? makeParts(t.extra) : []};
+  }
+  function prop(name) {
+    if (!ok() || !ICON[name]) return;
+    start();
+    const [m, c] = MINI[name] || ["sparkle", C.gold];
+    P = {kind: name, t0: performance.now(), minis: Array.from({length: 14}, () => {
+      const ang = rnd(0, 6.3), sp = rnd(2.5, 6);
+      return {m, c, x: 0, y: 0, vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp - 2, s: rnd(6, 11), a: rnd(0, 6.3), spin: rnd(-0.1, 0.1)};
+    })};
+    if (S) S.t0 = Math.max(S.t0, performance.now() + PROP_MS - SCENE_MS);   // 소품이 끝날 때까지 배경도 남긴다
+  }
+  addEventListener("resize", () => { if (raf) size(); });
+  return {play, prop, stop};
 })();
 
 // ── 사진 글자 읽기 ───────────────────────────────────────────
@@ -873,8 +1072,9 @@ $("#deleteAll").onclick = async () => {
   if (!me.has_character) { $("#setupTitle").textContent = "캐릭터 만들기"; show("setup"); return; }
   await loadHistory();
   // 개발 환경에서만: 주소 뒤에 ?fx=snow 처럼 붙이면 AI 없이 효과를 바로 재생해 본다.
-  const tryFx = new URLSearchParams(location.search).get("fx");
-  if (tryFx && cfg.show_turn_panel) fx.play(tryFx, 0.8);
+  // 소품은 0.9초 뒤 같은 주제로 나온다. &prop=cake 처럼 따로 고를 수도 있다.
+  const fxQuery = new URLSearchParams(location.search), tryFx = fxQuery.get("fx");
+  if (tryFx && cfg.show_turn_panel) { fx.play(tryFx, 0.8); setTimeout(() => fx.prop(fxQuery.get("prop") || tryFx), 900); }
   await greet();
   $("#input").focus();
 })();
