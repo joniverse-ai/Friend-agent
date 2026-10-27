@@ -2,9 +2,10 @@
 # 1) 시작 이미지와 Python 버전을 고정한다.
 FROM python:3.13-slim-bookworm
 
-# 2) 운영체제 프로그램 설치: 사진 글자 읽기에 쓰는 tesseract 와 한국어 데이터
+# 2) 운영체제 프로그램 설치: 사진 글자 읽기에 쓰는 tesseract 와 한국어 데이터,
+#    PDF 공지 글자 읽기에 쓰는 pdftotext(poppler-utils)
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-kor \
+    && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-kor poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
