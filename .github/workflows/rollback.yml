@@ -1,0 +1,73 @@
+# 원클릭 롤백. Actions 탭에서 이 워크플로를 고르고 Run workflow 버튼을 누르면 트래픽 100% 를 이전 리비전으로 옮긴다.
+# 이미지를 다시 만들지 않고 트래픽 설정만 바꾸므로 몇 초 만에 끝난다.
+# 롤백한 뒤에는 트래픽이 그 리비전에 고정된다. 다음 배포의 전환 단계(--to-latest)가 고정을 푼다.
+# Run workflow 버튼은 이 파일이 기본 브랜치(main)에 있어야 보인다.
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 되돌릴 환경
+        type: choice
+        options: [production, staging]
+        default: production
+      revision:
+        description: 되돌아갈 리비전 이름. 비워 두면 지금 리비전 바로 전에 만든 리비전
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  rollback:
+    runs-on: ubuntu-latest
+    # 환경을 쓰면 그 환경의 변수(SERVICE)를 읽고, production 은 배포처럼 승인을 거친다.
+    environment: ${{ inputs.target }}
+    env:
+      SERVICE: ${{ vars.SERVICE }}
+      INPUT_REVISION: ${{ inputs.revision }}
+    steps:
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.DEPLOY_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: 되돌아갈 리비전 정하기
+        run: |
+          gcloud run services describe "$SERVICE" --region us-central1 --format json > service.json
+          NOW=$(jq -r '.status.traffic | max_by(.percent) | .revisionName' service.json)
+          if [ -n "$INPUT_REVISION" ]; then
+            TARGET="$INPUT_REVISION"
+          else
+            # 이 서비스의 리비전을 만든 순서(최신부터)로 늘어놓고, 지금 리비전 바로 다음(=바로 전에 만든 것)을 고른다
+            TARGET=$(gcloud run revisions list --service "$SERVICE" --region us-central1 --sort-by "~metadata.creationTimestamp" --format "value(metadata.name)" \
+              | awk -v now="$NOW" 'found { print; exit } $0 == now { found = 1 }')
+          fi
+          # 다른 서비스의 리비전이나 없는 이름이면 여기서 멈춘다
+          OWNER=$(gcloud run revisions describe "$TARGET" --region us-central1 --format 'value(metadata.labels."serving.knative.dev/service")' 2>/dev/null || true)
+          if [ -z "$TARGET" ] || [ "$OWNER" != "$SERVICE" ]; then
+            echo "::error::되돌아갈 리비전을 찾지 못했다(입력: '${INPUT_REVISION}', 찾은 값: '${TARGET}')"
+            exit 1
+          fi
+          echo "지금 리비전 $NOW → 되돌아갈 리비전 $TARGET"
+          echo "NOW=$NOW" >> "$GITHUB_ENV"
+          echo "TARGET=$TARGET" >> "$GITHUB_ENV"
+          echo "URL=$(jq -r '.status.url' service.json)" >> "$GITHUB_ENV"
+
+      - name: 트래픽 100% 옮기기
+        run: gcloud run services update-traffic "$SERVICE" --region us-central1 --to-revisions "$TARGET=100"
+
+      - name: 결과 확인
+        run: |
+          VERSION=$(curl -s --max-time 10 "$URL/version")
+          echo "/version $VERSION"
+          echo "### 롤백 기록" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 서비스: \`$SERVICE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 롤백 전: \`$NOW\` → 롤백 후: \`$TARGET\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- /version: \`$VERSION\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 트래픽이 \`$TARGET\` 에 고정됨. 다음 배포의 전환 단계(--to-latest)가 푼다" >> "$GITHUB_STEP_SUMMARY"
