@@ -52,6 +52,8 @@ jobs:
           echo "COMMIT=$(jq -r '.spec.containers[0].env[] | select(.name=="COMMIT_SHA") | .value' rev.json)" >> "$GITHUB_ENV"
           echo "staging 리비전 $REV 의 이미지를 승격한다"
 
+      # 블루그린 1단계: 새 리비전을 트래픽 0% 로 올리고 green 태그를 붙인다. 사용자는 아직 이전 리비전을 쓴다.
+      # green 은 서비스 안에서 하나뿐이라, 배포할 때마다 이전 리비전에서 떼어 새 리비전으로 옮겨 간다.
       - id: deploy
         uses: google-github-actions/deploy-cloudrun@v3
         with:
@@ -63,6 +65,38 @@ jobs:
             COMMIT_SHA=${{ env.COMMIT }}
             ENV=${{ vars.ENV }}
           flags: --service-account=${{ vars.RUNTIME_SA }} --startup-probe=httpGet.path=/health,periodSeconds=5,failureThreshold=12,timeoutSeconds=2
+          no_traffic: true
+          tag: green
+
+      # 블루그린 2단계: 서비스 주소가 아니라 태그 URL 로 새 리비전만 확인한다(서비스 주소는 아직 이전 리비전이 답한다).
+      # /health 가 정상이고 /version 의 커밋이 이번 커밋이어야 통과. 끝까지 안 되면 실패로 끝나 전환 단계로 가지 않는다.
+      - name: 스모크 테스트 (태그 URL)
+        run: |
+          TAG_URL=$(gcloud run services describe "${{ vars.SERVICE }}" --region us-central1 --format json | jq -r '.status.traffic[] | select(.tag=="green") | .url')
+          echo "확인할 주소 $TAG_URL, 기대하는 커밋 $COMMIT"
+          for i in $(seq 1 12); do
+            HEALTH=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$TAG_URL/health" || true)
+            GOT=$(curl -s --max-time 5 "$TAG_URL/version" | jq -r '.commit // empty' || true)
+            echo "$i번째: /health $HEALTH, commit ${GOT:-없음}"
+            if [ "$HEALTH" = "200" ] && [ "$GOT" = "$COMMIT" ]; then echo "스모크 테스트 통과"; exit 0; fi
+            sleep 5
+          done
+          echo "::error::스모크 테스트 실패. 트래픽을 옮기지 않는다"
+          exit 1
+
+      # 블루그린 3단계: 트래픽 100% 를 가장 최근 리비전(방금 확인한 새 리비전)으로 옮긴다.
+      # 특정 리비전이 아니라 --to-latest 로 옮겨야 트래픽이 고정되지 않아, 다음 배포의 0% 단계가 꼬이지 않는다.
+      - name: 전환 (새 리비전으로 100%)
+        run: |
+          BEFORE=$(gcloud run services describe "${{ vars.SERVICE }}" --region us-central1 --format json | jq -r '[.status.traffic[] | select(.percent > 0) | "\(.revisionName)=\(.percent)%"] | join(", ")')
+          echo "전환 전 트래픽(롤백할 곳) $BEFORE"
+          gcloud run services update-traffic "${{ vars.SERVICE }}" --region us-central1 --to-latest
+          AFTER=$(gcloud run services describe "${{ vars.SERVICE }}" --region us-central1 --format json | jq -r '[.status.traffic[] | select(.percent > 0) | "\(.revisionName)=\(.percent)%"] | join(", ")')
+          echo "전환 후 트래픽 $AFTER"
+          echo "### 배포 기록" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 전환 전(롤백할 곳): \`$BEFORE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 전환 후: \`$AFTER\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- 커밋: \`$COMMIT\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: 배포 결과
         run: |
