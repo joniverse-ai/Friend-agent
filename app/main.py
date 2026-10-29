@@ -80,9 +80,6 @@ def home():
 
 @app.get("/health")
 def health():
-    # 스테이지 6 시험용: Cloud Run(K_SERVICE 가 있는 곳)에서만 망가진 버전. 확인한 뒤 Revert 한다.
-    if os.environ.get("K_SERVICE"):
-        return JSONResponse({"status": "broken"}, status_code=503)
     return {"status": "ok"}
 
 
