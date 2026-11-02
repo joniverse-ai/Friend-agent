@@ -3,10 +3,18 @@
 OpenAI와 Gemini는 같은 OpenAI SDK로 부르고, 주소(base_url)와 모델 이름만 다르다.
 Claude는 Anthropic SDK로 따로 부른다. 앱 안에서 쓰는 메시지 형식은 OpenAI 형식이라서, ClaudeLLM이 Claude 형식으로 바꿔 보낸다.
 fake 는 키 없이 화면과 흐름을 확인하거나 테스트할 때 쓰는 가짜 응답이다.
+세 클래스 모두 호출이 끝나면 모델 이름과 입력·출력 토큰 수를 트레이스에 적는다(비용 계산용).
 """
 import json
 import re
 import time
+
+from app import tracing
+
+
+def record_usage(model, input_tokens, output_tokens):
+    """지금 열려 있는 generation 에 모델과 토큰 수를 적는다. Langfuse 가 모델 이름으로 요금을 계산한다."""
+    tracing.update_generation(model=model, usage_details={"input": input_tokens or 0, "output": output_tokens or 0})
 
 
 class OpenAICompatibleLLM:
@@ -25,18 +33,29 @@ class OpenAICompatibleLLM:
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
             response_format={"type": "json_object"},
         )
+        self._record(response)
         return json.loads(response.choices[0].message.content)
 
     def complete_text(self, messages):
         response = self.client.chat.completions.create(model=self.model, messages=messages)
+        self._record(response)
         return response.choices[0].message.content.strip()
 
     def chat_stream(self, messages):
         """답을 만들어지는 대로 조금씩 돌려준다(스트리밍)."""
-        response = self.client.chat.completions.create(model=self.model, messages=messages, stream=True)
+        # include_usage: 스트리밍은 토큰 수를 따로 주지 않아서, 마지막 조각에 담아 달라고 요청한다
+        response = self.client.chat.completions.create(model=self.model, messages=messages, stream=True,
+                                                       stream_options={"include_usage": True})
         for event in response:
+            if getattr(event, "usage", None):
+                self._record(event)
             if event.choices and event.choices[0].delta.content:
                 yield event.choices[0].delta.content
+
+    def _record(self, response):
+        usage = getattr(response, "usage", None)  # 토큰 기록은 부가 기능이라 없으면 건너뛴다
+        if usage:
+            record_usage(getattr(response, "model", None) or self.model, usage.prompt_tokens, usage.completion_tokens)
 
 
 class ClaudeLLM:
@@ -79,6 +98,12 @@ class ClaudeLLM:
         return dict(model=self.model, max_tokens=self.MAX_TOKENS, system=system, messages=turns,
                     output_config=self.OUTPUT_CONFIG, betas=self.BETAS, fallbacks="default")
 
+    def _record(self, response):
+        # 대체 모델이 답했을 수 있어서, 요청한 이름 대신 실제로 답한 모델 이름을 적는다
+        usage = getattr(response, "usage", None)
+        if usage:
+            record_usage(getattr(response, "model", None) or self.model, usage.input_tokens, usage.output_tokens)
+
     def _text(self, response):
         if response.stop_reason == "refusal":
             return self.REFUSAL_NOTICE
@@ -88,13 +113,16 @@ class ClaudeLLM:
         """정해진 형식의 답이 필요할 때. 답에서 JSON 객체 하나를 찾아 dict로 돌려준다."""
         system = system + "\n\n반드시 JSON 객체 하나만 출력한다. 설명이나 코드 블록 표시는 붙이지 않는다."
         response = self.client.beta.messages.create(**self._request(system, [{"role": "user", "content": user}]))
+        self._record(response)
         if response.stop_reason == "refusal":
             raise ValueError("Claude가 요청을 거절했습니다.")
         return parse_json_object(self._text(response))
 
     def complete_text(self, messages):
         system, turns = self.to_claude(messages)
-        return self._text(self.client.beta.messages.create(**self._request(system, turns)))
+        response = self.client.beta.messages.create(**self._request(system, turns))
+        self._record(response)
+        return self._text(response)
 
     def chat_stream(self, messages):
         """답을 만들어지는 대로 조금씩 돌려준다(스트리밍)."""
@@ -104,7 +132,9 @@ class ClaudeLLM:
             for text in stream.text_stream:
                 sent = True
                 yield text
-            if stream.get_final_message().stop_reason == "refusal" and not sent:
+            final = stream.get_final_message()
+            self._record(final)
+            if final.stop_reason == "refusal" and not sent:
                 yield self.REFUSAL_NOTICE
 
 
@@ -151,9 +181,11 @@ class FakeLLM:
         return f"(가짜 응답) {body}"
 
     def complete_text(self, messages):
+        record_usage(self.model, 0, 0)
         return self._reply(messages)
 
     def chat_stream(self, messages):
+        record_usage(self.model, 0, 0)
         text = self._reply(messages)
         for i in range(0, len(text), 4):
             time.sleep(self.delay)

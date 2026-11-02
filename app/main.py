@@ -19,7 +19,7 @@ from fastapi import Depends, FastAPI, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app import agent, ocr, pdf, when
+from app import agent, ocr, pdf, tracing, when
 from app.auth import Auth, User
 from app.config import ROOT, load_settings
 from app.llm import make_llm
@@ -29,11 +29,14 @@ from app.store.base import make_store
 from app.tools import CITIES
 
 settings = load_settings()  # 꼭 필요한 값이 없으면 여기서 종료한다
+tracing.setup()  # .env 를 읽은 뒤에 만든다. Langfuse 키가 없으면 꺼진 채로 둔다
 llm = make_llm(settings)
 store = make_store(settings)
 current_user = Auth(settings)
 
-app = FastAPI(title="AI 친구 에이전트")
+# FastAPI 0.150 부터 켜져 있는 HTTP 요청 추적을 끈다. 켜 두면 Cloud Run 이 붙이는 traceparent 헤더를
+# 부모로 삼아, 헤더가 "기록 안 함(00)"인 요청의 Langfuse 트레이스가 통째로 버려진다(섹션 6에서 발견).
+app = FastAPI(title="AI 친구 에이전트", telemetry={"tracing": False})
 
 # 시작 지연 스위치(배포 실습용). 포트는 바로 열지만 정한 시간 동안은 준비 중이라 모든 요청에 503을 돌려준다.
 # AI 서비스가 시작할 때 모델 설정이나 색인을 불러오느라 늦게 준비되는 상황을 흉내 낸다. 기본값 0(끔).
@@ -67,6 +70,11 @@ class SettingsRequest(BaseModel):
 class ReportRequest(BaseModel):
     message_id: int
     reason: str = ""
+
+
+class FeedbackRequest(BaseModel):
+    message_id: int
+    liked: bool
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -167,13 +175,18 @@ def chat(req: ChatRequest, user: User = Depends(current_user), model=Depends(get
         except Exception as error:
             log("ERROR", "대화 처리 실패", error=type(error).__name__)
             yield json.dumps({"type": "error", "message": "답을 만들지 못했어요. 잠시 뒤 다시 보내 주세요."}, ensure_ascii=False) + "\n"
+        finally:
+            tracing.flush()  # 응답을 닫기 전에 트레이스를 보낸다(Cloud Run 은 응답 뒤 CPU를 거의 주지 않는다)
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
 @app.post("/api/greeting")
 def greeting(user: User = Depends(current_user), model=Depends(get_llm)):
-    return {"greeting": agent.greet(user.id, model, store)}
+    try:
+        return {"greeting": agent.greet(user.id, model, store)}
+    finally:
+        tracing.flush()
 
 
 @app.post("/api/ocr")
@@ -196,9 +209,30 @@ async def read_pdf(file: UploadFile, user: User = Depends(current_user)):
         raise HTTPException(500, str(error)) from error
 
 
+def my_answer(uid, message_id):
+    """로그인한 사용자의 답(assistant 메시지)만 꺼낸다. 남의 메시지나 없는 메시지면 404."""
+    message = store.get_message(uid, message_id)
+    if not message or message["role"] != "assistant":
+        raise HTTPException(404, "메시지를 찾지 못했습니다")
+    return message
+
+
+@app.post("/api/feedback")
+def feedback(req: FeedbackRequest, user: User = Depends(current_user)):
+    # 좋아요 1, 별로예요 0. 트레이스 ID는 화면이 아니라 서버에 저장된 meta 에서 꺼낸다
+    message = my_answer(user.id, req.message_id)
+    tracing.score(message["meta"].get("trace_id"), "user-feedback", 1 if req.liked else 0)
+    tracing.flush()
+    log("INFO", "답변 반응", message_id=req.message_id, liked=req.liked)
+    return {"ok": True}
+
+
 @app.post("/api/report")
 def report(req: ReportRequest, user: User = Depends(current_user)):
-    # 지금은 로그로만 남긴다. 관측 도구를 붙이면 그 도구의 점수로 보낸다.
+    # 신고 1 과 사유(comment)를 Langfuse 점수로 보낸다. 서버 로그에는 사유 원문 대신 길이만 남긴다
+    message = my_answer(user.id, req.message_id)
+    tracing.score(message["meta"].get("trace_id"), "report", 1, comment=req.reason)
+    tracing.flush()
     log("WARNING", "부적절한 답변 신고", message_id=req.message_id, reason_length=len(req.reason))
     return {"ok": True}
 
