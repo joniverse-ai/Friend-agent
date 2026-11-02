@@ -91,8 +91,8 @@ body.has-banner .app{height:calc(100dvh - 34px)}
 .note.rem{background:var(--orange);color:var(--ink);font-weight:800}
 .note.mem{background:var(--blue);color:var(--white)}
 .note.busy{background:var(--white);color:var(--mute)}
-.report{font-size:12px;font-weight:700;color:var(--mute);background:none;border:0;padding:2px 4px;opacity:0;transition:opacity .15s}
-.row.them:hover .report,.report:focus-visible{opacity:1}
+.report,.fb{font-size:12px;font-weight:700;color:var(--mute);background:none;border:0;padding:2px 4px;opacity:0;transition:opacity .15s}
+.row.them:hover .report,.report:focus-visible,.row.them:hover .fb,.fb:focus-visible,.fb.on{opacity:1}
 .day{align-self:center;font-size:12px;font-weight:700;background:var(--white);padding:3px 14px;border-radius:var(--pill)}
 
 /* 질문에 맞는 화면 효과: 대화창 전체를 덮고, 클릭은 아래로 통과시킨다 */
@@ -232,7 +232,7 @@ select.input{appearance:none;background-image:linear-gradient(45deg,transparent 
   .send .send-i{display:inline;font-family:var(--body);font-size:20px;font-weight:800}
 }
 @media (prefers-reduced-motion:reduce){
-  .side,.panel,.report{transition:none}
+  .side,.panel,.report,.fb{transition:none}
   .bubble .cursor{animation:none}
 }
 </style>
@@ -452,6 +452,21 @@ function bindReport(row, id) {
     await api("/api/report", {method: "POST", body: JSON.stringify({message_id: id, reason})});
     btn.textContent = "신고됨"; btn.disabled = true;
   };
+  bindFeedback(row, id, btn);
+}
+// 좋아요·별로예요: 답 하나에 한 번만 누른다. 누른 쪽은 계속 보인다
+function bindFeedback(row, id, reportBtn) {
+  if (row.querySelector(".fb")) return;
+  for (const [liked, label, title] of [[true, "👍", "좋아요"], [false, "👎", "별로예요"]]) {
+    const b = document.createElement("button");
+    b.className = "fb"; b.textContent = label; b.title = title; b.setAttribute("aria-label", title);
+    b.onclick = async () => {
+      await api("/api/feedback", {method: "POST", body: JSON.stringify({message_id: id, liked})});
+      row.querySelectorAll(".fb").forEach(x => x.disabled = true);
+      b.classList.add("on");
+    };
+    row.insertBefore(b, reportBtn);
+  }
 }
 function note(under, cls, text) {
   const n = document.createElement("span");

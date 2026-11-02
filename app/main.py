@@ -70,6 +70,11 @@ class ReportRequest(BaseModel):
     reason: str = ""
 
 
+class FeedbackRequest(BaseModel):
+    message_id: int
+    liked: bool
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     page = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
@@ -202,9 +207,30 @@ async def read_pdf(file: UploadFile, user: User = Depends(current_user)):
         raise HTTPException(500, str(error)) from error
 
 
+def my_answer(uid, message_id):
+    """로그인한 사용자의 답(assistant 메시지)만 꺼낸다. 남의 메시지나 없는 메시지면 404."""
+    message = store.get_message(uid, message_id)
+    if not message or message["role"] != "assistant":
+        raise HTTPException(404, "메시지를 찾지 못했습니다")
+    return message
+
+
+@app.post("/api/feedback")
+def feedback(req: FeedbackRequest, user: User = Depends(current_user)):
+    # 좋아요 1, 별로예요 0. 트레이스 ID는 화면이 아니라 서버에 저장된 meta 에서 꺼낸다
+    message = my_answer(user.id, req.message_id)
+    tracing.score(message["meta"].get("trace_id"), "user-feedback", 1 if req.liked else 0)
+    tracing.flush()
+    log("INFO", "답변 반응", message_id=req.message_id, liked=req.liked)
+    return {"ok": True}
+
+
 @app.post("/api/report")
 def report(req: ReportRequest, user: User = Depends(current_user)):
-    # 지금은 로그로만 남긴다. 관측 도구를 붙이면 그 도구의 점수로 보낸다.
+    # 신고 1 과 사유(comment)를 Langfuse 점수로 보낸다. 서버 로그에는 사유 원문 대신 길이만 남긴다
+    message = my_answer(user.id, req.message_id)
+    tracing.score(message["meta"].get("trace_id"), "report", 1, comment=req.reason)
+    tracing.flush()
     log("WARNING", "부적절한 답변 신고", message_id=req.message_id, reason_length=len(req.reason))
     return {"ok": True}
 
