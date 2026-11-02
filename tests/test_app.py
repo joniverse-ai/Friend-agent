@@ -76,3 +76,31 @@ def test_feedback_on_my_own_question_is_rejected():
     chat("안녕")
     mine = next(m for m in reversed(store.recent_messages("local-user", 10)) if m["role"] == "user")
     assert client.post("/api/feedback", json={"message_id": mine["id"], "liked": True}).status_code == 404
+
+
+def test_same_reminder_request_twice_saves_one():
+    # 같은 부탁을 두 번 해도 약속은 하나만 남는다(중복 저장 막기)
+    for _ in range(2):
+        chat("모레 저녁에 화분 물 주라고 알려 줘")
+    pending = [r for r in store.list_reminders("local-user", status="pending") if r["text"] == "화분 물 주기"]
+    assert len(pending) == 1
+
+
+class AskingModel:
+    """도구 선택 모델 흉내: 약속을 묻는 질문에도 create_reminder 를 고른다(staging 에서 실제로 본 실수)."""
+    can_reason = True
+
+    def complete_json(self, system, user):
+        return {"tools": [{"name": "create_reminder", "args": {"text": "친구 만나기", "due_at": "2026-12-01T09:00:00+09:00"}},
+                          {"name": "list_reminders", "args": {}}], "confidence": 0.8, "reason": "약속 이야기"}
+
+
+def test_question_about_reminder_does_not_save_reminder():
+    from app.router import choose
+    from app import when
+    now = when.now_in("Asia/Seoul")
+    for message in ["나 내일 약속이 어디에서였지?", "이해 못 했다면서. 왜 기억하고 그래..", "나 다음 주 토요일에 이사 가"]:
+        result = choose(message, [], now, "서울", AskingModel())
+        assert [t["name"] for t in result.tools] == ["list_reminders"], message
+    asked = choose("모레 9시에 친구 만나는 거 알려 줘", [], now, "서울", AskingModel())
+    assert "create_reminder" in [t["name"] for t in asked.tools]

@@ -176,8 +176,15 @@ def create_reminder(args, ctx):
     due, error = when.check_due(args.get("due_at"), now)
     if error:
         return ToolResult("create_reminder", False, f"약속을 저장하지 않았습니다: {error}")
-    reminder = ctx.store.add_reminder(ctx.user_id, text, due)
     local = due.astimezone(now.tzinfo)
+    # 같은 시각에 같은 내용(띄어쓰기 무시, 한쪽이 다른 쪽을 포함)이 이미 있으면 또 저장하지 않는다
+    new = text.replace(" ", "")
+    for r in ctx.store.list_reminders(ctx.user_id, status="pending"):
+        old = r["text"].replace(" ", "")
+        if r["due_at"] == due and (new in old or old in new):
+            return ToolResult("create_reminder", True, f"이미 저장된 약속입니다: {when.label(local)}에 '{r['text']}'.",
+                              {"id": r["id"], "text": r["text"], "due_at": local.isoformat(), "duplicate": True})
+    reminder = ctx.store.add_reminder(ctx.user_id, text, due)
     return ToolResult("create_reminder", True, f"약속을 저장했습니다: {when.label(local)}에 '{text}'.",
                       {"id": reminder["id"], "text": text, "due_at": local.isoformat()})
 
