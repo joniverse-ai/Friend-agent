@@ -66,7 +66,8 @@ def _turn(message, uid, llm, store, show_panel, settings, now):
             yield {"type": "turn", "tools": [], "confidence": None, "reason": "", "decided_by": "rule",
                    "action": "safety", "guards": guards}
         yield {"type": "delta", "text": CRISIS_REPLY}
-        saved = store.add_message(uid, "assistant", CRISIS_REPLY, {"action": "safety", "guards": guards})
+        saved = store.add_message(uid, "assistant", CRISIS_REPLY, {"action": "safety", "guards": guards,
+                                                                   "trace_id": tracing.current_trace_id()})
         log("WARNING", "위기 표현 안전 응답")
         tracing.update_span(output={"reply": CRISIS_REPLY, "message_id": saved["id"]})
         yield {"type": "done", "message_id": saved["id"]}
@@ -125,7 +126,8 @@ def _turn(message, uid, llm, store, show_panel, settings, now):
             yield {"type": "delta", "text": chunk}
         step.update(output=reply)
     meta = {"tools": [t["name"] for t in choice.tools], "confidence": choice.confidence,
-            "action": choice.action, "guards": choice.guards}
+            "action": choice.action, "guards": choice.guards,
+            "trace_id": tracing.current_trace_id()}   # 좋아요·별로예요·신고가 오면 이 트레이스에 점수를 붙인다
     saved = store.add_message(uid, "assistant", reply, meta)
 
     # ⑤ 기억 정리. 화면 소품 효과 고르기(효과 전용 AI 호출)를 동시에 시작해 둔다.

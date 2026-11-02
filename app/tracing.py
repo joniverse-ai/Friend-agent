@@ -15,7 +15,7 @@ import re
 from langfuse import Langfuse, get_client, observe, propagate_attributes
 
 __all__ = ["setup", "observation", "update_generation", "update_span", "flush", "observe",
-           "user_attributes", "tag_turn"]
+           "user_attributes", "tag_turn", "current_trace_id", "score"]
 
 # 카드 번호를 전화번호보다 먼저 가린다(16자리 안에 전화번호 모양이 들어 있을 수 있어서).
 # 한글은 글자(\w)로 쳐서 "010-1234-5678이야" 에서 \b 가 듣지 않는다. 그래서 숫자 앞뒤만 본다.
@@ -71,6 +71,21 @@ def tag_turn(tags, **metadata):
     """도구를 고른 뒤처럼 턴 중간에 알게 된 값을 지금 열린 트레이스에 tags 와 metadata 로 더한다."""
     with propagate_attributes(tags=list(tags) or None, metadata=metadata):
         pass  # 들어가는 순간 지금 열린 단계(chat-turn)에 붙는다. 이미 끝난 단계에는 붙지 않는다
+
+
+def current_trace_id():
+    """지금 열린 트레이스의 ID. 답을 저장할 때 meta 에 넣어 두면, 나중에 반응이 와도 그 트레이스에 점수를 붙일 수 있다."""
+    return get_client().get_current_trace_id() if enabled() else None
+
+
+def score(trace_id, name, value, comment=None):
+    """사용자 반응을 트레이스에 BOOLEAN 점수(1 또는 0)로 붙인다. 꺼져 있거나 트레이스 ID가 없으면 건너뛴다.
+
+    근거 문서: https://langfuse.com/docs/evaluation/evaluation-methods/scores-via-sdk (create_score)
+    """
+    if enabled() and trace_id:
+        get_client().create_score(name=name, value=value, trace_id=trace_id, data_type="BOOLEAN",
+                                  comment=mask_text(comment) if comment else None)
 
 
 def observation(name, as_type="span", **fields):

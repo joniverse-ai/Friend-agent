@@ -53,3 +53,26 @@ def test_ocr_is_off_by_default():
 def test_pdf_is_off_by_default():
     r = client.post("/api/pdf", files={"file": ("a.pdf", b"%PDF-1.4", "application/pdf")})
     assert r.status_code == 404
+
+
+def answer_id(events):
+    return next(e for e in events if e["type"] == "done")["message_id"]
+
+
+def test_feedback_and_report_on_my_answer_are_ok():
+    # Langfuse 키가 없는 테스트 환경에서는 점수 보내기를 건너뛰고 오류 없이 응답한다
+    mid = answer_id(chat("오늘 좀 피곤했어"))
+    assert client.post("/api/feedback", json={"message_id": mid, "liked": False}).status_code == 200
+    assert client.post("/api/report", json={"message_id": mid, "reason": "이상해요"}).status_code == 200
+
+
+def test_feedback_on_someone_elses_message_is_rejected():
+    other = store.add_message("someone-else", "assistant", "남의 답")
+    assert client.post("/api/feedback", json={"message_id": other["id"], "liked": True}).status_code == 404
+    assert client.post("/api/report", json={"message_id": other["id"], "reason": ""}).status_code == 404
+
+
+def test_feedback_on_my_own_question_is_rejected():
+    chat("안녕")
+    mine = next(m for m in reversed(store.recent_messages("local-user", 10)) if m["role"] == "user")
+    assert client.post("/api/feedback", json={"message_id": mine["id"], "liked": True}).status_code == 404
