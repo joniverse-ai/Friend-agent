@@ -41,10 +41,16 @@ def system_prompt(character, now, location, memories, summary, tool_lines=(), cl
 
 @tracing.observe(name="chat-turn", capture_input=False, capture_output=False)
 def run_turn(message, uid, llm, store, show_panel):
-    tracing.update_span(input=message)
     settings = store.get_settings(uid)
-    character = store.get_character(uid) or DEFAULT_CHARACTER
     now = when.now_in(settings["timezone"])
+    # 사용자·세션·버전을 턴 시작에서 한 번 붙이면 안의 모든 단계에 함께 붙는다
+    with tracing.user_attributes(uid, now):
+        tracing.update_span(input=message)
+        yield from _turn(message, uid, llm, store, show_panel, settings, now)
+
+
+def _turn(message, uid, llm, store, show_panel, settings, now):
+    character = store.get_character(uid) or DEFAULT_CHARACTER
     memories, summary, recent = memory.build_context(store, uid)
     history = [{"role": m["role"], "content": m["content"]} for m in recent]
     store.add_message(uid, "user", message)
@@ -55,6 +61,7 @@ def run_turn(message, uid, llm, store, show_panel):
         step.update(output={"crisis": crisis})
     if crisis:
         guards = ["위기 표현이 있어 캐릭터 설정과 상관없이 정해진 안전 응답을 보냈습니다."]
+        tracing.tag_turn(["safety"], safety=True)
         if show_panel:
             yield {"type": "turn", "tools": [], "confidence": None, "reason": "", "decided_by": "rule",
                    "action": "safety", "guards": guards}
@@ -71,6 +78,9 @@ def run_turn(message, uid, llm, store, show_panel):
         choice = choose(message, history, now, settings["location"], llm)
         step.update(output={"tools": choice.tools, "confidence": choice.confidence, "decided_by": choice.decided_by,
                             "action": choice.action, "reason": choice.reason})
+    tool_names = [t["name"] for t in choice.tools]
+    tracing.tag_turn(tool_names + (["clarify"] if choice.action == "clarify" else []),
+                     tools=tool_names, confidence=choice.confidence, safety=False)
     if show_panel:
         yield {"type": "turn", "tools": [{"name": t["name"], "label": TOOLS[t["name"]]["label"], "args": t["args"]}
                                          for t in choice.tools],
@@ -160,8 +170,9 @@ def greet(uid, llm, store):
     system += "\n\n[먼저 말 걸기]\n" + " ".join(guide)
     messages = [{"role": "system", "content": system}, {"role": "user", "content": "(앱을 열었다. 먼저 말을 걸어 줘)"}]
     # 먼저 말 걸기는 대화 턴과 따로인 greeting 트레이스 하나다. AI를 부르니 generation 으로 남긴다
-    with tracing.observation("greeting", "generation", input=messages,
-                             metadata={"reminders": len(due), "first_meeting": not last}) as step:
+    with tracing.user_attributes(uid, now, tags=["greeting"]), \
+            tracing.observation("greeting", "generation", input=messages,
+                                metadata={"reminders": len(due), "first_meeting": not last}) as step:
         text = llm.complete_text(messages)
         step.update(output=text)
     saved = store.add_message(uid, "assistant", text, {"action": "greeting", "reminders": [r["id"] for r in due]})

@@ -6,13 +6,16 @@
 - 키(LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY)가 둘 다 있을 때만 켜진다. 없으면 아무것도 보내지 않고 앱은 그대로 돈다.
 - 보내기 전에 전화번호, 이메일, 카드 번호를 가린다(mask). 대화 원문은 Langfuse 에만 남고, 서버 로그에는 여전히 남기지 않는다.
 - 근거 문서: https://langfuse.com/docs/observability/sdk/python/overview (SDK 5.1.0)
+- 사용자·세션·버전 속성: https://langfuse.com/docs/observability/sdk/python/instrumentation (propagate_attributes)
+  한 번 정하면 그 안에서 만드는 모든 단계에 함께 붙는다. 환경(environment)은 클라이언트를 만들 때 한 번 정한다.
 """
 import os
 import re
 
-from langfuse import Langfuse, get_client, observe
+from langfuse import Langfuse, get_client, observe, propagate_attributes
 
-__all__ = ["setup", "observation", "update_generation", "update_span", "flush", "observe"]
+__all__ = ["setup", "observation", "update_generation", "update_span", "flush", "observe",
+           "user_attributes", "tag_turn"]
 
 # 카드 번호를 전화번호보다 먼저 가린다(16자리 안에 전화번호 모양이 들어 있을 수 있어서).
 # 한글은 글자(\w)로 쳐서 "010-1234-5678이야" 에서 \b 가 듣지 않는다. 그래서 숫자 앞뒤만 본다.
@@ -46,7 +49,28 @@ def enabled():
 
 def setup():
     """.env 를 읽은 뒤(main.py) 한 번 부른다. 이후 observe 와 get_client 는 이 클라이언트를 쓴다."""
-    return Langfuse(tracing_enabled=enabled(), mask=mask)
+    return Langfuse(tracing_enabled=enabled(), mask=mask,
+                    environment=os.environ.get("ENV", "local").strip() or "local",   # local, staging, production
+                    release=os.environ.get("COMMIT_SHA", "local").strip() or "local")
+
+
+def user_attributes(uid, now, tags=()):
+    """with 문 안에서 만드는 트레이스에 사용자, 세션, 버전을 붙인다.
+
+    - user_id: 로그인으로 확인한 사용자 ID. 이메일은 넣지 않는다.
+    - session_id: 사용자 ID + 사용자 시간대의 날짜. 이 앱은 대화방이 따로 없어서 하루치 대화를 한 세션으로 본다.
+    - version: Cloud Run 이 넣어 주는 리비전 이름(K_REVISION). 내 컴퓨터에서는 local.
+    """
+    return propagate_attributes(
+        user_id=uid, session_id=f"{uid}-{now.date().isoformat()}",
+        version=os.environ.get("K_REVISION", "local"),
+        metadata={"commit": os.environ.get("COMMIT_SHA", "local")}, tags=list(tags) or None)
+
+
+def tag_turn(tags, **metadata):
+    """도구를 고른 뒤처럼 턴 중간에 알게 된 값을 지금 열린 트레이스에 tags 와 metadata 로 더한다."""
+    with propagate_attributes(tags=list(tags) or None, metadata=metadata):
+        pass  # 들어가는 순간 지금 열린 단계(chat-turn)에 붙는다. 이미 끝난 단계에는 붙지 않는다
 
 
 def observation(name, as_type="span", **fields):
