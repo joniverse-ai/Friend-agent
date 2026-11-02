@@ -6,3 +6,5 @@ import os
 
 os.environ.update({"LLM_PROVIDER": "fake", "LLM_API_KEY": "", "STORAGE": "memory", "AUTH": "none"})
 os.environ.setdefault("ENV", "test")
+# 로컬 .env 에 Langfuse 키가 있어도 테스트는 트레이스를 보내지 않는다(config.load_dotenv 는 이미 있는 값을 덮지 않는다)
+os.environ.update({"LANGFUSE_PUBLIC_KEY": "", "LANGFUSE_SECRET_KEY": ""})

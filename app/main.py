@@ -19,7 +19,7 @@ from fastapi import Depends, FastAPI, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app import agent, ocr, pdf, when
+from app import agent, ocr, pdf, tracing, when
 from app.auth import Auth, User
 from app.config import ROOT, load_settings
 from app.llm import make_llm
@@ -29,6 +29,7 @@ from app.store.base import make_store
 from app.tools import CITIES
 
 settings = load_settings()  # 꼭 필요한 값이 없으면 여기서 종료한다
+tracing.setup()  # .env 를 읽은 뒤에 만든다. Langfuse 키가 없으면 꺼진 채로 둔다
 llm = make_llm(settings)
 store = make_store(settings)
 current_user = Auth(settings)
@@ -167,13 +168,18 @@ def chat(req: ChatRequest, user: User = Depends(current_user), model=Depends(get
         except Exception as error:
             log("ERROR", "대화 처리 실패", error=type(error).__name__)
             yield json.dumps({"type": "error", "message": "답을 만들지 못했어요. 잠시 뒤 다시 보내 주세요."}, ensure_ascii=False) + "\n"
+        finally:
+            tracing.flush()  # 응답을 닫기 전에 트레이스를 보낸다(Cloud Run 은 응답 뒤 CPU를 거의 주지 않는다)
 
     return StreamingResponse(events(), media_type="application/x-ndjson")
 
 
 @app.post("/api/greeting")
 def greeting(user: User = Depends(current_user), model=Depends(get_llm)):
-    return {"greeting": agent.greet(user.id, model, store)}
+    try:
+        return {"greeting": agent.greet(user.id, model, store)}
+    finally:
+        tracing.flush()
 
 
 @app.post("/api/ocr")
