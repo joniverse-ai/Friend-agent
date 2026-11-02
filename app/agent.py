@@ -10,10 +10,13 @@
    응답 뒤 백그라운드로 돌리면 기억 정리가 멈추거나 늦어진다. 그래서 응답을 닫기 전에 처리한다.
 
 결과는 이벤트(dict)로 하나씩 내보낸다. show_panel 이 꺼져 있으면(production) 개발용 이벤트는 아예 만들지 않는다.
-"""
-from datetime import timedelta
 
-from app import effects, memory, when
+트레이스(tracing.py): 한 턴은 chat-turn 트레이스 하나이고, 단계마다 safety, choose-tools, tool:<이름>, reply,
+memory-update, memory-summary 로 나눠 남긴다. AI를 부르는 단계는 generation 이라 토큰과 요금이 함께 남는다.
+"""
+from datetime import datetime, timedelta, timezone
+
+from app import effects, memory, tracing, when
 from app.logs import log
 from app.persona import DEFAULT_CHARACTER, build_persona
 from app.router import choose
@@ -36,7 +39,9 @@ def system_prompt(character, now, location, memories, summary, tool_lines=(), cl
     return "\n\n".join(parts)
 
 
+@tracing.observe(name="chat-turn", capture_input=False, capture_output=False)
 def run_turn(message, uid, llm, store, show_panel):
+    tracing.update_span(input=message)
     settings = store.get_settings(uid)
     character = store.get_character(uid) or DEFAULT_CHARACTER
     now = when.now_in(settings["timezone"])
@@ -45,7 +50,10 @@ def run_turn(message, uid, llm, store, show_panel):
     store.add_message(uid, "user", message)
 
     # ① 위기 표현
-    if is_crisis(message):
+    with tracing.observation("safety", input=message) as step:
+        crisis = is_crisis(message)
+        step.update(output={"crisis": crisis})
+    if crisis:
         guards = ["위기 표현이 있어 캐릭터 설정과 상관없이 정해진 안전 응답을 보냈습니다."]
         if show_panel:
             yield {"type": "turn", "tools": [], "confidence": None, "reason": "", "decided_by": "rule",
@@ -53,12 +61,16 @@ def run_turn(message, uid, llm, store, show_panel):
         yield {"type": "delta", "text": CRISIS_REPLY}
         saved = store.add_message(uid, "assistant", CRISIS_REPLY, {"action": "safety", "guards": guards})
         log("WARNING", "위기 표현 안전 응답")
+        tracing.update_span(output={"reply": CRISIS_REPLY, "message_id": saved["id"]})
         yield {"type": "done", "message_id": saved["id"]}
         return
 
     # ② 도구 선택. 화면 배경 효과 고르기(효과 전용 AI 호출)를 동시에 시작해 둔다.
     scene_job = effects.start_scene(message, history, llm)
-    choice = choose(message, history, now, settings["location"], llm)
+    with tracing.observation("choose-tools", "generation", input=message) as step:
+        choice = choose(message, history, now, settings["location"], llm)
+        step.update(output={"tools": choice.tools, "confidence": choice.confidence, "decided_by": choice.decided_by,
+                            "action": choice.action, "reason": choice.reason})
     if show_panel:
         yield {"type": "turn", "tools": [{"name": t["name"], "label": TOOLS[t["name"]]["label"], "args": t["args"]}
                                          for t in choice.tools],
@@ -67,7 +79,13 @@ def run_turn(message, uid, llm, store, show_panel):
 
     # ③ 도구 실행
     ctx = Context(store, uid, settings["location"], settings["timezone"])
-    results = [run_tool(t["name"], t["args"], ctx) for t in choice.tools]
+    results = []
+    for t in choice.tools:
+        with tracing.observation(f"tool:{t['name']}", input=t["args"]) as step:
+            r = run_tool(t["name"], t["args"], ctx)
+            step.update(output={"ok": r.ok, "summary": r.summary, "data": r.data},
+                        level="DEFAULT" if r.ok else "ERROR")
+        results.append(r)
     for r in results:
         if show_panel:
             yield {"type": "tool", "name": r.name, "label": TOOLS[r.name]["label"], "ok": r.ok,
@@ -88,9 +106,14 @@ def run_turn(message, uid, llm, store, show_panel):
         yield {"type": "context", "memories": [m["text"] for m in memories],
                "summary": summary["text"] if summary else None, "recent_messages": len(history)}
     reply = ""
-    for chunk in llm.chat_stream([{"role": "system", "content": system}, *history, {"role": "user", "content": message}]):
-        reply += chunk
-        yield {"type": "delta", "text": chunk}
+    messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": message}]
+    with tracing.observation("reply", "generation", input=messages) as step:
+        for chunk in llm.chat_stream(messages):
+            if not reply:  # 첫 글자가 나온 시각. 사용자가 기다린 시간은 여기까지다
+                step.update(completion_start_time=datetime.now(timezone.utc))
+            reply += chunk
+            yield {"type": "delta", "text": chunk}
+        step.update(output=reply)
     meta = {"tools": [t["name"] for t in choice.tools], "confidence": choice.confidence,
             "action": choice.action, "guards": choice.guards}
     saved = store.add_message(uid, "assistant", reply, meta)
@@ -98,14 +121,18 @@ def run_turn(message, uid, llm, store, show_panel):
     # ⑤ 기억 정리. 화면 소품 효과 고르기(효과 전용 AI 호출)를 동시에 시작해 둔다.
     prop_job = effects.start_prop(message, reply, llm) if choice.action != "clarify" else None
     yield {"type": "memory_start"}
-    changes = memory.update_memories(store, uid, message, reply, now, llm)
-    memory.maybe_summarize(store, uid, llm)
+    with tracing.observation("memory-update", "generation", input={"message": message, "reply": reply}) as step:
+        changes = memory.update_memories(store, uid, message, reply, now, llm)
+        step.update(output={k: [m["text"] for m in v] for k, v in changes.items()})
+    with tracing.observation("memory-summary", "generation") as step:
+        step.update(output={"summarized": memory.maybe_summarize(store, uid, llm)})
     yield {"type": "memory", "added": [m["text"] for m in changes["added"]],
            "updated": [m["text"] for m in changes["updated"]], "removed": [m["text"] for m in changes["removed"]]}
     # 화면 효과 ② 포인트 소품: 효과 전용 AI가 완성된 답을 보고 고른 주제(fake 모드는 단어 사전)
     accent = effects.prop(reply, scene and scene["name"], effects.result(prop_job, "prop")) if choice.action != "clarify" else None
     if accent:
         yield {"type": "effect", "layer": "prop", **accent}
+    tracing.update_span(output={"reply": reply, "message_id": saved["id"]})
     yield {"type": "done", "message_id": saved["id"]}
 
 
@@ -131,8 +158,12 @@ def greet(uid, llm, store):
     if not last:
         guide.append("처음 만난 사이다. 이름을 넣어 짧게 자기소개를 한다.")
     system += "\n\n[먼저 말 걸기]\n" + " ".join(guide)
-    text = llm.complete_text([{"role": "system", "content": system},
-                              {"role": "user", "content": "(앱을 열었다. 먼저 말을 걸어 줘)"}])
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": "(앱을 열었다. 먼저 말을 걸어 줘)"}]
+    # 먼저 말 걸기는 대화 턴과 따로인 greeting 트레이스 하나다. AI를 부르니 generation 으로 남긴다
+    with tracing.observation("greeting", "generation", input=messages,
+                             metadata={"reminders": len(due), "first_meeting": not last}) as step:
+        text = llm.complete_text(messages)
+        step.update(output=text)
     saved = store.add_message(uid, "assistant", text, {"action": "greeting", "reminders": [r["id"] for r in due]})
     log("INFO", "먼저 말 걸기", reminders=len(due))
     return {"id": saved["id"], "text": text, "reminders": [r["text"] for r in due]}

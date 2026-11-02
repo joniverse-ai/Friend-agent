@@ -9,8 +9,10 @@ AI는 TOPIC_DESC 목록 안에서만 고르고, 대화와 뚜렷하게 관련된
 AI가 없는 fake 모드에서는 단어 사전(TOPICS)이 대신한다.
 화면에는 주제 이름과 세기(0~1)만 보낸다. 대화 원문이나 도구 원본 데이터는 담지 않는다.
 """
+import contextvars
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 
+from app import tracing
 from app.logs import log
 
 AI_TIMEOUT = 5.0   # 효과 호출이 이 시간(초) 안에 답하지 않으면 효과 없이 넘어간다
@@ -63,11 +65,21 @@ def prop_prompt():
 
 
 def _ask(llm, system, user, key):
-    try:
-        return ai_topic(llm.complete_json(system, user).get(key))
-    except Exception as error:   # 효과는 장식이라, 실패하면 효과 없이 넘어간다
-        log("WARNING", "화면 효과 선택 실패", step=key, error=type(error).__name__)
-        return "none"
+    # effect-scene / effect-prop. 효과도 AI 호출이라 토큰과 요금이 들어서 트레이스에 남긴다
+    with tracing.observation(f"effect-{key}", "generation", input=user) as step:
+        try:
+            topic = ai_topic(llm.complete_json(system, user).get(key))
+        except Exception as error:   # 효과는 장식이라, 실패하면 효과 없이 넘어간다
+            log("WARNING", "화면 효과 선택 실패", step=key, error=type(error).__name__)
+            step.update(level="WARNING", status_message=type(error).__name__)
+            topic = "none"
+        step.update(output=topic)
+        return topic
+
+
+def _submit(*args):
+    """다른 스레드에서 돌려도 지금 열린 트레이스(chat-turn)의 자식으로 남도록 실행 맥락을 함께 넘긴다."""
+    return _pool.submit(contextvars.copy_context().run, _ask, *args)
 
 
 def start_scene(message, history, llm):
@@ -75,14 +87,14 @@ def start_scene(message, history, llm):
     if not getattr(llm, "can_reason", False):
         return None
     recent = "\n".join(f"{m['role']}: {m['content']}" for m in history[-4:]) or "(없음)"
-    return _pool.submit(_ask, llm, scene_prompt(), f"[최근 대화]\n{recent}\n\n[메시지]\n{message}", "scene")
+    return _submit(llm, scene_prompt(), f"[최근 대화]\n{recent}\n\n[메시지]\n{message}", "scene")
 
 
 def start_prop(message, reply, llm):
     """소품 고르기를 바로 시작한다(기억 정리와 동시에). 모델이 없으면 None."""
     if not getattr(llm, "can_reason", False):
         return None
-    return _pool.submit(_ask, llm, prop_prompt(), f"[사용자 메시지]\n{message}\n\n[캐릭터 답]\n{reply}", "prop")
+    return _submit(llm, prop_prompt(), f"[사용자 메시지]\n{message}\n\n[캐릭터 답]\n{reply}", "prop")
 
 
 def result(job, step):
