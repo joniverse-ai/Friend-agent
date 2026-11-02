@@ -24,6 +24,9 @@ KEYWORDS = {
 ASK_PATTERN = re.compile(r"(라고|으라고|하라고)\s*(꼭\s*)?(알려|말해)|잊지 않게|리마인드|깨워")
 CANCEL_WORDS = ["취소", "지워", "없던 걸로", "안 알려 줘도", "안 알려줘도"]
 LIST_PATTERN = re.compile(r"(약속|알림|리마인드).*(뭐|목록|있어|있지|있었|보여|확인)")
+# 약속을 저장해 달라는 부탁 표현. 모델이 create_reminder 를 골라도 메시지에 이게 없으면 뺀다(안전장치).
+# "어디서 만나기로 했지?", "왜 기억하고 그래", "다음 주에 이사 가" 처럼 묻거나 항의하거나 일정만 말할 때 저장하지 않는다.
+REMIND_REQUEST = re.compile(r"알려|리마인드|깨워|잊지 않게|까먹지 않게|기억해|저장해|등록해|챙겨 ?줘|말해 ?줘")
 
 
 def router_prompt():
@@ -40,6 +43,7 @@ def router_prompt():
         "- location 은 메시지에 도시 이름이 있으면 그 도시, 없으면 사용자 지역이다.",
         "- date 는 [달력]을 보고 정한 YYYY-MM-DD 날짜다. 날짜 표현이 없으면 오늘이다.",
         "- create_reminder 는 사용자가 나중에 알려 달라고 분명히 부탁할 때만 고른다. 일정이 있다는 이야기만 하면 고르지 않는다.",
+        "- 약속을 묻는 질문('어디서였지?', '언제야?'), 항의나 되물음('왜 기억해?', '뭐라고?')에는 create_reminder 를 고르지 않는다. 약속을 물으면 list_reminders 를 고른다.",
         "- create_reminder 의 text 는 알려 줄 내용만 짧게 쓴다. 예: '우산 챙기기', '일찍 자기'.",
         "- create_reminder 의 due_at 은 [지금] 시각과 시간대를 기준으로 계산한다. 시각 없이 날짜만 있으면 09:00, 아침 08:00, 점심 12:00, 저녁 19:00, 밤 21:00 으로 한다.",
         "- 최근 대화를 보고 '그럼 모레는?' 같은 이어지는 질문의 도구와 인자를 정한다.",
@@ -131,6 +135,11 @@ def model_choose(message, history, now, location, llm):
                 t["args"][key], fixed = when.fix_year(t["args"][key], now)
                 if fixed:
                     result.guards.append(f"{t['name']} 의 {key} 연도가 지난 연도라 {now.year}년으로 고쳤습니다.")
+
+    # 안전장치: 부탁하는 말이 없는 메시지에서 모델이 고른 약속 저장은 뺀다
+    if not REMIND_REQUEST.search(message) and any(t["name"] == "create_reminder" for t in result.tools):
+        result.tools = [t for t in result.tools if t["name"] != "create_reminder"]
+        result.guards.append("알려 달라는 부탁이 없는 메시지라 약속 저장을 하지 않았습니다.")
     return result
 
 
