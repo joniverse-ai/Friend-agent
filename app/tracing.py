@@ -15,7 +15,7 @@ import re
 from langfuse import Langfuse, get_client, observe, propagate_attributes
 
 __all__ = ["setup", "observation", "update_generation", "update_span", "flush", "observe",
-           "user_attributes", "tag_turn", "current_trace_id", "score"]
+           "user_attributes", "tag_turn", "current_trace_id", "score", "get_prompt"]
 
 # 카드 번호를 전화번호보다 먼저 가린다(16자리 안에 전화번호 모양이 들어 있을 수 있어서).
 # 한글은 글자(\w)로 쳐서 "010-1234-5678이야" 에서 \b 가 듣지 않는다. 그래서 숫자 앞뒤만 본다.
@@ -86,6 +86,18 @@ def score(trace_id, name, value, comment=None):
     if enabled() and trace_id:
         get_client().create_score(name=name, value=value, trace_id=trace_id, data_type="BOOLEAN",
                                   comment=mask_text(comment) if comment else None)
+
+
+def get_prompt(name, label, fallback):
+    """Langfuse 프롬프트 관리에서 라벨이 붙은 text 프롬프트를 가져온다. 꺼져 있으면 None.
+    처음 시작할 때 Langfuse 에 닿지 못하면 fallback 문장으로 만든 프롬프트(is_fallback=True)가 돌아온다.
+
+    근거 문서: https://langfuse.com/docs/prompt-management/get-started (get_prompt, label, fallback)
+    """
+    if not enabled():
+        return None
+    return get_client().get_prompt(name, label=label, type="text", fallback=fallback,
+                                   fetch_timeout_seconds=3, max_retries=1)
 
 
 def observation(name, as_type="span", **fields):

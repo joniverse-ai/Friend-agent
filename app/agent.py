@@ -76,12 +76,13 @@ def _turn(message, uid, llm, store, show_panel, settings, now):
     # ② 도구 선택. 화면 배경 효과 고르기(효과 전용 AI 호출)를 동시에 시작해 둔다.
     scene_job = effects.start_scene(message, history, llm)
     with tracing.observation("choose-tools", "generation", input=message) as step:
-        choice = choose(message, history, now, settings["location"], llm)
+        choice = choose(message, history, now, settings["location"], llm, user_id=uid)
         step.update(output={"tools": choice.tools, "confidence": choice.confidence, "decided_by": choice.decided_by,
                             "action": choice.action, "reason": choice.reason})
     tool_names = [t["name"] for t in choice.tools]
     tracing.tag_turn(tool_names + (["clarify"] if choice.action == "clarify" else []),
-                     tools=tool_names, confidence=choice.confidence, safety=False)
+                     tools=tool_names, confidence=choice.confidence, safety=False,
+                     **({"ab_variant": choice.ab_variant} if choice.ab_variant else {}))
     if show_panel:
         yield {"type": "turn", "tools": [{"name": t["name"], "label": TOOLS[t["name"]]["label"], "args": t["args"]}
                                          for t in choice.tools],

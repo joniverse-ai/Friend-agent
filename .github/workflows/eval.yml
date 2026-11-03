@@ -1,0 +1,31 @@
+# 평가 관문: 도구 선택 평가(data/eval/tool_selection.jsonl 41개)를 실제 LLM 으로 돌려, 기준에 못 미치면 실패로 끝낸다.
+# 실제 LLM 을 41번 부르므로 PR 마다 자동으로 돌지 않는다. 다음 두 경우에만 돈다.
+#   1) PR 에 eval 라벨을 붙였을 때 (라벨이 붙은 PR 에 새 커밋을 올려도 다시 돈다)
+#   2) Actions > eval > Run workflow 버튼 (이 파일이 main 에 있어야 버튼이 보인다)
+# 키: 저장소 시크릿 EVAL_LLM_API_KEY (사용 한도를 건 평가용 OpenAI 키). Langfuse 키는 넣지 않아 코드에 남긴 지시문으로 평가한다.
+# 기준: 같은 코드로도 실행마다 한두 개 흔들리므로 지금 결과(도구 36~38, 인자 33~36)보다 조금 낮게 잡았다.
+name: eval
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tool-selection:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'eval')
+    runs-on: ubuntu-latest
+    env:
+      LLM_PROVIDER: openai
+      LLM_MODEL: gpt-4o-mini
+      LLM_API_KEY: ${{ secrets.EVAL_LLM_API_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt
+      - run: python scripts/eval_tools.py --min-tools 35 --min-args 32
