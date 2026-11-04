@@ -22,6 +22,7 @@ class MemoryStore:
         self.ids = itertools.count(1)
         self.users = {}
         self.ledger = []  # 크레딧 원장. 사용자 데이터 삭제(delete_all)와 따로 둔다
+        self.orders = {}  # 결제 주문. order_id → 주문
 
     def _user(self, uid):
         return self.users.setdefault(uid, {
@@ -143,6 +144,35 @@ class MemoryStore:
     def credit_history(self, uid, limit=10):
         rows = [dict(row) for row in self.ledger if row["user_id"] == uid]
         return list(reversed(rows))[:limit]
+
+    # 결제 주문. 상태는 대기(pending)에서만 바뀐다
+    def create_order(self, uid, order_id, product_id, amount, credits):
+        with self.lock:
+            order = {"order_id": order_id, "user_id": uid, "product_id": product_id, "amount": amount,
+                     "credits": credits, "status": "pending", "payment_key": None, "approved_at": None,
+                     "created_at": utcnow()}
+            self.orders[order_id] = order
+            return dict(order)
+
+    def get_order(self, uid, order_id):
+        """이 사용자의 주문 하나. 남의 주문이면 None."""
+        order = self.orders.get(order_id)
+        return dict(order) if order and order["user_id"] == uid else None
+
+    def finish_order(self, uid, order_id, payment_key, approved_at):
+        """대기 중인 내 주문만 완료로 바꾼다. 바꿨으면 주문, 아니면 None."""
+        with self.lock:
+            order = self.orders.get(order_id)
+            if not order or order["user_id"] != uid or order["status"] != "pending":
+                return None
+            order.update(status="done", payment_key=payment_key, approved_at=approved_at)
+            return dict(order)
+
+    def fail_order(self, uid, order_id):
+        with self.lock:
+            order = self.orders.get(order_id)
+            if order and order["user_id"] == uid and order["status"] == "pending":
+                order["status"] = "failed"
 
     def delete_all(self, uid):
         self.users.pop(uid, None)  # 크레딧 원장은 지우지 않는다(지우면 무료 크레딧을 다시 받을 수 있다)

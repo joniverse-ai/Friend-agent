@@ -164,6 +164,30 @@ class SupabaseStore:
                          select="id,delta,reason,ref,created_at")
         return [{**row, "created_at": parse_time(row["created_at"])} for row in rows]
 
+    # 결제 주문(supabase/migrations/0003_orders.sql). 상태는 대기(pending)에서만 바뀐다
+    def _order(self, row):
+        return {**row, "approved_at": parse_time(row.get("approved_at")), "created_at": parse_time(row["created_at"])}
+
+    def create_order(self, uid, order_id, product_id, amount, credits):
+        return self._order(self._insert("orders", {"order_id": order_id, "user_id": uid, "product_id": product_id,
+                                                   "amount": amount, "credits": credits}))
+
+    def get_order(self, uid, order_id):
+        """user_id 조건을 함께 걸어서 남의 주문이면 None."""
+        rows = self._get("orders", user_id=f"eq.{uid}", order_id=f"eq.{order_id}", limit=1)
+        return self._order(rows[0]) if rows else None
+
+    def finish_order(self, uid, order_id, payment_key, approved_at):
+        """status 가 pending 인 행만 바꾸는 조건부 업데이트. 동시에 두 요청이 와도 한쪽만 주문을 돌려받는다."""
+        rows = self._update("orders", {"status": "done", "payment_key": payment_key, "approved_at": approved_at,
+                                       "updated_at": iso(datetime.now(timezone.utc))},
+                            user_id=f"eq.{uid}", order_id=f"eq.{order_id}", status="eq.pending")
+        return self._order(rows[0]) if rows else None
+
+    def fail_order(self, uid, order_id):
+        self._update("orders", {"status": "failed", "updated_at": iso(datetime.now(timezone.utc))},
+                     user_id=f"eq.{uid}", order_id=f"eq.{order_id}", status="eq.pending")
+
     def delete_all(self, uid):
         # 크레딧 원장은 지우지 않는다(지우면 무료 크레딧을 다시 받을 수 있다)
         for table in ("messages", "summaries", "memories", "reminders", "characters", "user_settings"):

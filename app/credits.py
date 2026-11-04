@@ -8,6 +8,13 @@
 """
 import uuid
 
+# 상품표(섹션 3). 서버의 이 한 곳에만 둔다. 화면은 /api/products 로 받아 보여 주고, 주문은 상품 ID만 보낸다.
+PRODUCTS = {
+    "credits_100": {"name": "크레딧 100개", "amount": 1000, "credits": 100},
+    "credits_550": {"name": "크레딧 550개", "amount": 5000, "credits": 550},
+    "credits_1200": {"name": "크레딧 1,200개", "amount": 10000, "credits": 1200},
+}
+
 FREE_CREDITS = 30
 MESSAGE_COST = 1
 NO_CREDITS = {"error": "insufficient_credits",
