@@ -4,7 +4,9 @@
 - /health, /version: 서비스 상태와 배포 버전
 - /api/config: 화면이 쓰는 설정(로그인 방식, 개발용 패널 표시 여부)
 - /api/character, /api/settings: 캐릭터와 사용자 설정
-- /api/chat: 메시지 한 턴. 결과를 이벤트(JSON 한 줄씩)로 스트리밍한다
+- /api/chat: 메시지 한 턴. 결과를 이벤트(JSON 한 줄씩)로 스트리밍한다. 받자마자 1크레딧 차감, 모자라면 402
+- /api/credits: 크레딧 잔액과 최근 기록 10줄
+- /api/products, /api/orders, /api/payments/confirm: 크레딧 결제(토스페이먼츠 결제위젯)
 - /api/greeting: 앱을 열 때 먼저 말 걸기
 - /api/ocr: 사진 속 글자 읽기(OCR_ENABLED=true 일 때)
 - /api/pdf: PDF 공지문 글자 읽기(PDF_ENABLED=true 일 때)
@@ -12,21 +14,42 @@
 """
 import html
 import json
+import logging
 import os
+import re
 import time
+import uuid
 
-from fastapi import Depends, FastAPI, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app import agent, ocr, pdf, tracing, when
+from app import agent, credits, ocr, payments, pdf, tracing, when
 from app.auth import Auth, User
 from app.config import ROOT, load_settings
 from app.llm import make_llm
 from app.logs import log
 from app.persona import DEFAULT_CHARACTER, OPTIONS, build_persona, clean_character
+from app.safety import is_crisis
 from app.store.base import make_store
 from app.tools import CITIES
+
+class HidePaymentKey(logging.Filter):
+    """uvicorn 접근 기록에서 결제 성공 주소의 paymentKey 값을 앞 6자만 남기고 가린다.
+
+    토스페이먼츠가 성공 주소(/?pay=success&paymentKey=…)에 붙여 보내는 값이라, 그대로 두면 서버 로그에 전체가 남는다.
+    배포한 뒤 Cloud Run 이 따로 남기는 요청 기록의 주소는 앱에서 가릴 수 없다.
+    """
+    def filter(self, record):
+        if isinstance(record.args, tuple) and len(record.args) >= 3 and isinstance(record.args[2], str):
+            args = list(record.args)
+            args[2] = PAYMENT_KEY_IN_URL.sub(r"\1…", args[2])
+            record.args = tuple(args)
+        return True
+
+
+PAYMENT_KEY_IN_URL = re.compile(r"(paymentKey=[^&\s]{0,6})[^&\s]*")
+logging.getLogger("uvicorn.access").addFilter(HidePaymentKey())
 
 settings = load_settings()  # 꼭 필요한 값이 없으면 여기서 종료한다
 tracing.setup()  # .env 를 읽은 뒤에 만든다. Langfuse 키가 없으면 꺼진 채로 둔다
@@ -77,6 +100,20 @@ class FeedbackRequest(BaseModel):
     liked: bool
 
 
+class OrderRequest(BaseModel):
+    product_id: str  # 금액은 받지 않는다. 서버가 상품표에서 찾는다
+
+
+class ConfirmRequest(BaseModel):
+    payment_key: str
+    order_id: str
+    amount: int
+
+
+class FailRequest(BaseModel):
+    code: str = ""
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
     page = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
@@ -106,13 +143,122 @@ def config():
             "supabase_publishable_key": settings.supabase_publishable_key if settings.auth == "supabase" else "",
             "google_login": settings.google_login, "show_turn_panel": settings.show_turn_panel,
             "ocr_enabled": settings.ocr_enabled, "pdf_enabled": settings.pdf_enabled,
+            # 클라이언트 키는 결제위젯을 띄우는 공개 키다. 시크릿 키는 여기에 넣지 않는다.
+            "payments_enabled": payments_enabled(),
+            "toss_client_key": settings.toss_client_key if payments_enabled() else "",
             "options": OPTIONS, "cities": list(CITIES)}
 
 
 @app.get("/api/me")
-def me(user: User = Depends(current_user)):
+def me(request: Request, user: User = Depends(current_user)):
+    # 처음 온 사용자에게 무료 크레딧(한 번만, 같은 IP에서는 하루 3명까지)
+    granted = credits.grant_signup(store, user.id, ip_hash(request))
+    if granted == "granted":
+        log("INFO", "가입 무료 크레딧 지급", credits=credits.FREE_CREDITS)
+    elif granted == "limited":
+        log("WARNING", "가입 무료 크레딧 한도 초과(같은 IP)", limit=credits.SIGNUP_PER_IP_PER_DAY)
     return {"id": user.id, "anonymous": user.anonymous, "email": user.email,
-            "has_character": store.get_character(user.id) is not None}
+            "has_character": store.get_character(user.id) is not None,
+            "credits": store.credit_balance(user.id)}
+
+
+def ip_hash(request: Request):
+    """요청 보낸 곳의 IP 해시. IP 원문은 저장하거나 로그에 남기지 않는다.
+
+    Cloud Run 앞단은 X-Forwarded-For 맨 뒤에 실제 접속 IP를 붙인다. 앞쪽 값은 요청한 사람이 마음대로 넣을 수
+    있으므로 맨 뒤 값만 쓴다. 헤더가 없으면(내 컴퓨터) 연결된 주소를 쓴다.
+    """
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = forwarded.split(",")[-1].strip() if forwarded else (request.client.host if request.client else "")
+    return credits.hash_ip(ip, settings.supabase_secret_key or "local")
+
+
+@app.get("/api/credits")
+def my_credits(user: User = Depends(current_user)):
+    return {"balance": store.credit_balance(user.id),
+            "history": [{"delta": r["delta"], "reason": r["reason"], "created_at": r["created_at"].isoformat()}
+                        for r in store.credit_history(user.id, 10)]}
+
+
+# ── 크레딧 결제 ─────────────────────────────────────────────────────
+# 주문 저장 → 결제위젯(화면) → successUrl → 금액·상태 확인 → 시크릿 키로 승인 → 주문 완료 + 원장 + 줄.
+# 크레딧을 늘리는 곳은 confirm_payment 한 곳뿐이다.
+
+def payments_enabled():
+    return bool(settings.toss_client_key and settings.toss_secret_key)
+
+
+@app.get("/api/products")
+def products():
+    return [{"id": pid, "name": p["name"], "amount": p["amount"], "credits": p["credits"],
+             "unit_price": round(p["amount"] / p["credits"], 1)} for pid, p in credits.PRODUCTS.items()]
+
+
+@app.post("/api/orders")
+def create_order(req: OrderRequest, user: User = Depends(current_user)):
+    if not payments_enabled():
+        raise HTTPException(503, "결제가 아직 준비되지 않았습니다")
+    product = credits.PRODUCTS.get(req.product_id)
+    if not product:
+        raise HTTPException(400, "없는 상품입니다")
+    order_id = f"ord_{uuid.uuid4().hex}"  # 추측할 수 없는 무작위 값
+    store.create_order(user.id, order_id, req.product_id, product["amount"], product["credits"])
+    log("INFO", "주문 저장", order_id=order_id, product_id=req.product_id, amount=product["amount"])
+    return {"order_id": order_id, "order_name": product["name"], "amount": product["amount"],
+            "credits": product["credits"]}
+
+
+def paid_result(uid, order):
+    return {"ok": True, "order_id": order["order_id"], "credits": order["credits"],
+            "balance": store.credit_balance(uid)}
+
+
+@app.post("/api/payments/confirm")
+def confirm_payment(req: ConfirmRequest, user: User = Depends(current_user)):
+    if not payments_enabled():
+        raise HTTPException(503, "결제가 아직 준비되지 않았습니다")
+    order = store.get_order(user.id, req.order_id)  # user_id 조건: 남의 주문이면 없는 주문과 같다
+    if not order:
+        log("WARNING", "결제 승인 거절: 주문 없음", order_id=req.order_id)
+        raise HTTPException(404, "주문을 찾지 못했습니다")
+    if req.amount != order["amount"]:
+        log("WARNING", "결제 승인 거절: 금액 불일치", order_id=req.order_id)
+        raise HTTPException(400, "결제 금액이 주문 금액과 다릅니다")
+    if order["status"] == "done":  # 새로고침 등으로 다시 온 요청: 승인 API를 다시 부르지 않고 처음 결과를 돌려준다
+        return paid_result(user.id, order)
+    if order["status"] != "pending":
+        raise HTTPException(409, "이미 끝난 주문입니다")
+
+    # 멱등키는 주문 번호. 같은 주문의 승인 요청에는 몇 번을 다시 보내도 같은 값이 간다
+    idempotency_key = req.order_id
+    log("INFO", "결제 승인 요청", order_id=req.order_id, idempotency_key=idempotency_key)
+    result = payments.confirm(settings.toss_secret_key, req.payment_key, req.order_id, req.amount, idempotency_key)
+    if result.ok and (result.data.get("status") != "DONE" or result.data.get("totalAmount") != order["amount"]):
+        result = payments.Confirmed(False, {"code": "UNEXPECTED_RESPONSE", "message": "승인 결과가 주문과 맞지 않아요"})
+    if not result.ok and result.data["code"] in (payments.PROCESSING, "NETWORK_ERROR"):
+        # 승인이 됐는지 아직 모른다. 주문을 실패로 바꾸지 않고 대기로 둔다(새로고침하면 같은 키로 다시 묻는다)
+        log("WARNING", "결제 승인 결과 미확인", order_id=req.order_id, code=result.data["code"])
+        return JSONResponse({"ok": False, "code": result.data["code"],
+                             "message": "결제 확인이 늦어지고 있어요. 잠시 뒤 이 페이지를 새로고침해 주세요."}, status_code=503)
+    if not result.ok:
+        store.fail_order(user.id, req.order_id)
+        log("WARNING", "결제 승인 실패", order_id=req.order_id, code=result.data["code"])
+        return JSONResponse({"ok": False, "code": result.data["code"], "message": result.data["message"]}, status_code=400)
+
+    done = store.finish_order(user.id, req.order_id, req.payment_key, result.data.get("approvedAt"))
+    if done is None:  # 같은 주문의 다른 요청이 먼저 완료했다
+        return paid_result(user.id, store.get_order(user.id, req.order_id))
+    store.add_credit(user.id, order["credits"], "purchase", f"order:{req.order_id}")
+    log("INFO", "결제 완료, 크레딧 지급", order_id=req.order_id, credits=order["credits"])
+    return paid_result(user.id, done)
+
+
+@app.post("/api/orders/{order_id}/fail")
+def fail_order(order_id: str, req: FailRequest, user: User = Depends(current_user)):
+    # 실패 주소(failUrl)로 돌아온 주문. 내 주문이 대기일 때만 실패로 바꾼다
+    store.fail_order(user.id, order_id)
+    log("INFO", "결제 실패로 돌아옴", order_id=order_id, code=req.code[:60])
+    return {"ok": True}
 
 
 # ── 캐릭터와 설정 ──────────────────────────────────────────────────
@@ -163,17 +309,29 @@ def messages(user: User = Depends(current_user)):
 
 
 @app.post("/api/chat")
-def chat(req: ChatRequest, user: User = Depends(current_user), model=Depends(get_llm)):
+def chat(req: ChatRequest, request: Request, user: User = Depends(current_user), model=Depends(get_llm)):
     message = req.message.strip()[:1000]
     if not message:
         raise HTTPException(400, "메시지가 비어 있습니다")
 
+    # 크레딧: 답을 만들기 전에, 받자마자 서버에서 차감한다. 위기 표현은 차감하지 않고 안전 응답으로 보낸다.
+    charge = None
+    if not is_crisis(message):
+        charge, balance = credits.charge_message(store, user.id, ip_hash(request))
+        if charge is None:
+            log("INFO", "크레딧 부족으로 메시지 거절")
+            return JSONResponse(credits.NO_CREDITS, status_code=402)
+
     def events():
         try:
+            if charge:
+                yield json.dumps({"type": "credits", "balance": balance}) + "\n"
             for event in agent.run_turn(message, user.id, model, store, settings.show_turn_panel):
                 yield json.dumps(event, ensure_ascii=False, default=str) + "\n"
         except Exception as error:
             log("ERROR", "대화 처리 실패", error=type(error).__name__)
+            if charge and credits.refund_message(store, user.id, charge):
+                log("INFO", "실패한 메시지 크레딧 되돌림")
             yield json.dumps({"type": "error", "message": "답을 만들지 못했어요. 잠시 뒤 다시 보내 주세요."}, ensure_ascii=False) + "\n"
         finally:
             tracing.flush()  # 응답을 닫기 전에 트레이스를 보낸다(Cloud Run 은 응답 뒤 CPU를 거의 주지 않는다)

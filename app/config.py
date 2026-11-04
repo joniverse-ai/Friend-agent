@@ -39,6 +39,8 @@ class Settings:
     show_turn_panel: bool
     ocr_enabled: bool
     pdf_enabled: bool
+    toss_client_key: str      # 결제위젯용 클라이언트 키(test_gck_…). 화면에 보내도 되는 값
+    toss_secret_key: str      # 결제 승인용 시크릿 키(test_gsk_…). 서버만 쓰고 화면, 로그에 남기지 않는다
 
 
 def load_dotenv(path):
@@ -113,7 +115,11 @@ def load_settings():
         show_turn_panel=env_flag("SHOW_TURN_PANEL", env != "production"),
         ocr_enabled=env_flag("OCR_ENABLED", False),  # 사진 글자 읽기. tesseract 프로그램이 필요하다
         pdf_enabled=env_flag("PDF_ENABLED", False),  # PDF 공지문 글자 읽기. pdftotext(poppler) 프로그램이 필요하다
+        # 두 키가 다 있을 때만 결제를 켠다. 없으면 크레딧은 쓰되 살 수는 없다
+        toss_client_key=os.environ.get("TOSS_CLIENT_KEY", "").strip(),
+        toss_secret_key=os.environ.get("TOSS_SECRET_KEY", "").strip(),
     )
     log("INFO", "앱을 시작합니다.", provider=settings.provider, model=settings.model, env=settings.env,
-        storage=settings.storage, auth=settings.auth, turn_panel=settings.show_turn_panel)
+        storage=settings.storage, auth=settings.auth, turn_panel=settings.show_turn_panel,
+        payments=bool(settings.toss_client_key and settings.toss_secret_key))
     return settings

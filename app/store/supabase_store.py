@@ -138,6 +138,61 @@ class SupabaseStore:
                             user_id=f"eq.{uid}", status="eq.pending", due_at=f"lte.{iso(now)}")
         return [self._reminder(r) for r in rows]
 
+    # 크레딧 원장(supabase/migrations/0002_credits.sql)
+    def _rpc(self, name, **args):
+        r = self.http.post(f"/rpc/{name}", json=args)
+        r.raise_for_status()
+        return r.json()
+
+    def credit_balance(self, uid):
+        return self._rpc("credit_balance", p_user=uid) or 0
+
+    def add_credit(self, uid, delta, reason, ref):
+        """+ 또는 - 줄 하나를 쌓는다. ref 가 유일해서 같은 ref 가 이미 있으면 쌓지 않고 False."""
+        r = self.http.post("/credit_ledger", params={"on_conflict": "ref"},
+                           json={"user_id": uid, "delta": delta, "reason": reason, "ref": ref},
+                           headers={"Prefer": "return=representation,resolution=ignore-duplicates"})
+        r.raise_for_status()
+        return bool(r.json())
+
+    def grant_signup(self, uid, amount, ip_hash, daily_limit):
+        """가입 무료 크레딧. 데이터베이스 함수가 IP 해시별 잠금을 걸고 최근 24시간 지급 수를 센 뒤 쌓는다."""
+        return self._rpc("grant_signup", p_user=uid, p_amount=amount, p_ip_hash=ip_hash, p_daily_limit=daily_limit)
+
+    def spend_credit(self, uid, ref, amount=1):
+        """데이터베이스 함수가 잠금을 걸고 잔액 확인과 - 줄 기록을 한 번에 한다. 모자라면 None."""
+        return self._rpc("spend_credit", p_user=uid, p_ref=ref, p_amount=amount)
+
+    def credit_history(self, uid, limit=10):
+        rows = self._get("credit_ledger", user_id=f"eq.{uid}", order="id.desc", limit=limit,
+                         select="id,delta,reason,ref,created_at")
+        return [{**row, "created_at": parse_time(row["created_at"])} for row in rows]
+
+    # 결제 주문(supabase/migrations/0003_orders.sql). 상태는 대기(pending)에서만 바뀐다
+    def _order(self, row):
+        return {**row, "approved_at": parse_time(row.get("approved_at")), "created_at": parse_time(row["created_at"])}
+
+    def create_order(self, uid, order_id, product_id, amount, credits):
+        return self._order(self._insert("orders", {"order_id": order_id, "user_id": uid, "product_id": product_id,
+                                                   "amount": amount, "credits": credits}))
+
+    def get_order(self, uid, order_id):
+        """user_id 조건을 함께 걸어서 남의 주문이면 None."""
+        rows = self._get("orders", user_id=f"eq.{uid}", order_id=f"eq.{order_id}", limit=1)
+        return self._order(rows[0]) if rows else None
+
+    def finish_order(self, uid, order_id, payment_key, approved_at):
+        """status 가 pending 인 행만 바꾸는 조건부 업데이트. 동시에 두 요청이 와도 한쪽만 주문을 돌려받는다."""
+        rows = self._update("orders", {"status": "done", "payment_key": payment_key, "approved_at": approved_at,
+                                       "updated_at": iso(datetime.now(timezone.utc))},
+                            user_id=f"eq.{uid}", order_id=f"eq.{order_id}", status="eq.pending")
+        return self._order(rows[0]) if rows else None
+
+    def fail_order(self, uid, order_id):
+        self._update("orders", {"status": "failed", "updated_at": iso(datetime.now(timezone.utc))},
+                     user_id=f"eq.{uid}", order_id=f"eq.{order_id}", status="eq.pending")
+
     def delete_all(self, uid):
+        # 크레딧 원장은 지우지 않는다(지우면 무료 크레딧을 다시 받을 수 있다)
         for table in ("messages", "summaries", "memories", "reminders", "characters", "user_settings"):
             self._delete(table, user_id=f"eq.{uid}")

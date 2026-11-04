@@ -7,7 +7,7 @@
 """
 import itertools
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.store.base import DEFAULT_SETTINGS
 
@@ -21,6 +21,8 @@ class MemoryStore:
         self.lock = threading.Lock()
         self.ids = itertools.count(1)
         self.users = {}
+        self.ledger = []  # 크레딧 원장. 사용자 데이터 삭제(delete_all)와 따로 둔다
+        self.orders = {}  # 결제 주문. order_id → 주문
 
     def _user(self, uid):
         return self.users.setdefault(uid, {
@@ -112,5 +114,80 @@ class MemoryStore:
                     claimed.append(dict(r))
         return claimed
 
+    # 크레딧 원장. 잔액은 delta 의 합이고, ref 가 같은 줄은 두 번 쌓지 않는다
+    def _balance(self, uid):
+        return sum(row["delta"] for row in self.ledger if row["user_id"] == uid)
+
+    def credit_balance(self, uid):
+        with self.lock:
+            return self._balance(uid)
+
+    def add_credit(self, uid, delta, reason, ref):
+        """+ 또는 - 줄 하나를 쌓는다. 같은 ref 가 이미 있으면 쌓지 않고 False."""
+        with self.lock:
+            if any(row["ref"] == ref for row in self.ledger):
+                return False
+            self.ledger.append({"id": next(self.ids), "user_id": uid, "delta": delta, "reason": reason,
+                                "ref": ref, "created_at": utcnow()})
+            return True
+
+    def grant_signup(self, uid, amount, ip_hash, daily_limit):
+        """가입 무료 크레딧. 같은 IP 해시로 최근 24시간에 daily_limit 명까지만 준다."""
+        with self.lock:
+            ref = f"signup:{uid}"
+            if any(row["ref"] == ref for row in self.ledger):
+                return "exists"
+            since = utcnow() - timedelta(hours=24)
+            given = sum(1 for row in self.ledger if row["reason"] == "signup" and ip_hash
+                        and row.get("ip_hash") == ip_hash and row["created_at"] > since)
+            if given >= daily_limit:
+                return "limited"
+            self.ledger.append({"id": next(self.ids), "user_id": uid, "delta": amount, "reason": "signup",
+                                "ref": ref, "ip_hash": ip_hash, "created_at": utcnow()})
+            return "granted"
+
+    def spend_credit(self, uid, ref, amount=1):
+        """잔액 확인과 - 줄 기록을 잠금 안에서 한 번에 한다. 모자라면 None, 성공하면 차감 뒤 잔액."""
+        with self.lock:
+            balance = self._balance(uid)
+            if balance < amount:
+                return None
+            self.ledger.append({"id": next(self.ids), "user_id": uid, "delta": -amount, "reason": "message",
+                                "ref": ref, "created_at": utcnow()})
+            return balance - amount
+
+    def credit_history(self, uid, limit=10):
+        rows = [dict(row) for row in self.ledger if row["user_id"] == uid]
+        return list(reversed(rows))[:limit]
+
+    # 결제 주문. 상태는 대기(pending)에서만 바뀐다
+    def create_order(self, uid, order_id, product_id, amount, credits):
+        with self.lock:
+            order = {"order_id": order_id, "user_id": uid, "product_id": product_id, "amount": amount,
+                     "credits": credits, "status": "pending", "payment_key": None, "approved_at": None,
+                     "created_at": utcnow()}
+            self.orders[order_id] = order
+            return dict(order)
+
+    def get_order(self, uid, order_id):
+        """이 사용자의 주문 하나. 남의 주문이면 None."""
+        order = self.orders.get(order_id)
+        return dict(order) if order and order["user_id"] == uid else None
+
+    def finish_order(self, uid, order_id, payment_key, approved_at):
+        """대기 중인 내 주문만 완료로 바꾼다. 바꿨으면 주문, 아니면 None."""
+        with self.lock:
+            order = self.orders.get(order_id)
+            if not order or order["user_id"] != uid or order["status"] != "pending":
+                return None
+            order.update(status="done", payment_key=payment_key, approved_at=approved_at)
+            return dict(order)
+
+    def fail_order(self, uid, order_id):
+        with self.lock:
+            order = self.orders.get(order_id)
+            if order and order["user_id"] == uid and order["status"] == "pending":
+                order["status"] = "failed"
+
     def delete_all(self, uid):
-        self.users.pop(uid, None)
+        self.users.pop(uid, None)  # 크레딧 원장은 지우지 않는다(지우면 무료 크레딧을 다시 받을 수 있다)
