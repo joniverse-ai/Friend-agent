@@ -214,10 +214,17 @@ def confirm_payment(req: ConfirmRequest, user: User = Depends(current_user)):
     if order["status"] != "pending":
         raise HTTPException(409, "이미 끝난 주문입니다")
 
-    log("INFO", "결제 승인 요청", order_id=req.order_id)
-    result = payments.confirm(settings.toss_secret_key, req.payment_key, req.order_id, req.amount)
+    # 멱등키는 주문 번호. 같은 주문의 승인 요청에는 몇 번을 다시 보내도 같은 값이 간다
+    idempotency_key = req.order_id
+    log("INFO", "결제 승인 요청", order_id=req.order_id, idempotency_key=idempotency_key)
+    result = payments.confirm(settings.toss_secret_key, req.payment_key, req.order_id, req.amount, idempotency_key)
     if result.ok and (result.data.get("status") != "DONE" or result.data.get("totalAmount") != order["amount"]):
         result = payments.Confirmed(False, {"code": "UNEXPECTED_RESPONSE", "message": "승인 결과가 주문과 맞지 않아요"})
+    if not result.ok and result.data["code"] in (payments.PROCESSING, "NETWORK_ERROR"):
+        # 승인이 됐는지 아직 모른다. 주문을 실패로 바꾸지 않고 대기로 둔다(새로고침하면 같은 키로 다시 묻는다)
+        log("WARNING", "결제 승인 결과 미확인", order_id=req.order_id, code=result.data["code"])
+        return JSONResponse({"ok": False, "code": result.data["code"],
+                             "message": "결제 확인이 늦어지고 있어요. 잠시 뒤 이 페이지를 새로고침해 주세요."}, status_code=503)
     if not result.ok:
         store.fail_order(user.id, req.order_id)
         log("WARNING", "결제 승인 실패", order_id=req.order_id, code=result.data["code"])
