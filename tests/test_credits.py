@@ -18,8 +18,17 @@ def uid():
     """테스트마다 처음 온 새 사용자로 요청을 보낸다."""
     user_id = f"credit-test-{uuid.uuid4().hex[:8]}"
     app.dependency_overrides[current_user] = lambda: User(user_id, anonymous=True)
+    client.headers["x-forwarded-for"] = f"10.{uuid.uuid4().int % 250}.{uuid.uuid4().int % 250}.{uuid.uuid4().int % 250}"
     yield user_id
     app.dependency_overrides.pop(current_user, None)
+    client.headers.pop("x-forwarded-for", None)
+
+
+def as_guest(ip, forwarded=None):
+    """IP 하나에서 새 게스트로 /api/me 를 부르고 받은 크레딧을 돌려준다."""
+    gid = f"guest-{uuid.uuid4().hex[:8]}"
+    app.dependency_overrides[current_user] = lambda: User(gid, anonymous=True)
+    return client.get("/api/me", headers={"x-forwarded-for": forwarded or ip}).json()["credits"]
 
 
 def send(message):
@@ -106,6 +115,20 @@ def test_concurrent_spend_at_balance_one_passes_once(uid):
         t.join()
     assert sum(r is not None for r in results) == 1
     assert store.credit_balance(uid) == 0
+
+
+def test_free_credits_limited_per_ip_per_day(uid):
+    # 같은 IP에서 새 게스트를 계속 만들어도 무료 크레딧은 3명까지만. 다른 IP는 따로 센다
+    ip = "203.0.113.7"
+    assert [as_guest(ip) for _ in range(5)] == [30, 30, 30, 0, 0]
+    assert as_guest("203.0.113.8") == 30
+
+
+def test_forged_forwarded_header_does_not_reset_limit(uid):
+    # X-Forwarded-For 앞쪽에 가짜 IP를 넣어도, 맨 뒤의 실제 접속 IP로 센다
+    ip = "198.51.100.9"
+    got = [as_guest(ip, forwarded=f"1.2.3.{i}, {ip}") for i in range(4)]
+    assert got == [30, 30, 30, 0]
 
 
 def test_delete_all_keeps_the_ledger(uid):

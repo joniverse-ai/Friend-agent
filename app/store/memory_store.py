@@ -7,7 +7,7 @@
 """
 import itertools
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.store.base import DEFAULT_SETTINGS
 
@@ -130,6 +130,21 @@ class MemoryStore:
             self.ledger.append({"id": next(self.ids), "user_id": uid, "delta": delta, "reason": reason,
                                 "ref": ref, "created_at": utcnow()})
             return True
+
+    def grant_signup(self, uid, amount, ip_hash, daily_limit):
+        """가입 무료 크레딧. 같은 IP 해시로 최근 24시간에 daily_limit 명까지만 준다."""
+        with self.lock:
+            ref = f"signup:{uid}"
+            if any(row["ref"] == ref for row in self.ledger):
+                return "exists"
+            since = utcnow() - timedelta(hours=24)
+            given = sum(1 for row in self.ledger if row["reason"] == "signup" and ip_hash
+                        and row.get("ip_hash") == ip_hash and row["created_at"] > since)
+            if given >= daily_limit:
+                return "limited"
+            self.ledger.append({"id": next(self.ids), "user_id": uid, "delta": amount, "reason": "signup",
+                                "ref": ref, "ip_hash": ip_hash, "created_at": utcnow()})
+            return "granted"
 
     def spend_credit(self, uid, ref, amount=1):
         """잔액 확인과 - 줄 기록을 잠금 안에서 한 번에 한다. 모자라면 None, 성공하면 차감 뒤 잔액."""

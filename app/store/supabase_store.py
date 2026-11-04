@@ -155,6 +155,10 @@ class SupabaseStore:
         r.raise_for_status()
         return bool(r.json())
 
+    def grant_signup(self, uid, amount, ip_hash, daily_limit):
+        """가입 무료 크레딧. 데이터베이스 함수가 IP 해시별 잠금을 걸고 최근 24시간 지급 수를 센 뒤 쌓는다."""
+        return self._rpc("grant_signup", p_user=uid, p_amount=amount, p_ip_hash=ip_hash, p_daily_limit=daily_limit)
+
     def spend_credit(self, uid, ref, amount=1):
         """데이터베이스 함수가 잠금을 걸고 잔액 확인과 - 줄 기록을 한 번에 한다. 모자라면 None."""
         return self._rpc("spend_credit", p_user=uid, p_ref=ref, p_amount=amount)

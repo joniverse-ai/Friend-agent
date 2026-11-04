@@ -20,7 +20,7 @@ import re
 import time
 import uuid
 
-from fastapi import Depends, FastAPI, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -150,12 +150,27 @@ def config():
 
 
 @app.get("/api/me")
-def me(user: User = Depends(current_user)):
-    if credits.grant_signup(store, user.id):  # 처음 온 사용자에게 무료 크레딧(한 번만 쌓인다)
+def me(request: Request, user: User = Depends(current_user)):
+    # 처음 온 사용자에게 무료 크레딧(한 번만, 같은 IP에서는 하루 3명까지)
+    granted = credits.grant_signup(store, user.id, ip_hash(request))
+    if granted == "granted":
         log("INFO", "가입 무료 크레딧 지급", credits=credits.FREE_CREDITS)
+    elif granted == "limited":
+        log("WARNING", "가입 무료 크레딧 한도 초과(같은 IP)", limit=credits.SIGNUP_PER_IP_PER_DAY)
     return {"id": user.id, "anonymous": user.anonymous, "email": user.email,
             "has_character": store.get_character(user.id) is not None,
             "credits": store.credit_balance(user.id)}
+
+
+def ip_hash(request: Request):
+    """요청 보낸 곳의 IP 해시. IP 원문은 저장하거나 로그에 남기지 않는다.
+
+    Cloud Run 앞단은 X-Forwarded-For 맨 뒤에 실제 접속 IP를 붙인다. 앞쪽 값은 요청한 사람이 마음대로 넣을 수
+    있으므로 맨 뒤 값만 쓴다. 헤더가 없으면(내 컴퓨터) 연결된 주소를 쓴다.
+    """
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = forwarded.split(",")[-1].strip() if forwarded else (request.client.host if request.client else "")
+    return credits.hash_ip(ip, settings.supabase_secret_key or "local")
 
 
 @app.get("/api/credits")
@@ -294,7 +309,7 @@ def messages(user: User = Depends(current_user)):
 
 
 @app.post("/api/chat")
-def chat(req: ChatRequest, user: User = Depends(current_user), model=Depends(get_llm)):
+def chat(req: ChatRequest, request: Request, user: User = Depends(current_user), model=Depends(get_llm)):
     message = req.message.strip()[:1000]
     if not message:
         raise HTTPException(400, "메시지가 비어 있습니다")
@@ -302,7 +317,7 @@ def chat(req: ChatRequest, user: User = Depends(current_user), model=Depends(get
     # 크레딧: 답을 만들기 전에, 받자마자 서버에서 차감한다. 위기 표현은 차감하지 않고 안전 응답으로 보낸다.
     charge = None
     if not is_crisis(message):
-        charge, balance = credits.charge_message(store, user.id)
+        charge, balance = credits.charge_message(store, user.id, ip_hash(request))
         if charge is None:
             log("INFO", "크레딧 부족으로 메시지 거절")
             return JSONResponse(credits.NO_CREDITS, status_code=402)
