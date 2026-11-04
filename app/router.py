@@ -4,14 +4,17 @@
 2. 안전장치: 확신도가 기준보다 낮으면 도구를 쓰지 않고 되묻는다(코드 규칙).
 fake 모드처럼 모델을 쓰지 않을 때나 모델 응답을 읽지 못했을 때는 키워드 규칙이 같은 형식으로 답한다.
 """
+import hashlib
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
-from app import when
+from app import tracing, when
 from app.logs import log
 from app.tools import CITIES, TOOLS
 
+ROUTER_PROMPT = "router"   # Langfuse 프롬프트 관리의 이름
 CONFIDENCE_THRESHOLD = 0.6
 MAX_TOOLS = 2
 
@@ -29,12 +32,21 @@ LIST_PATTERN = re.compile(r"(약속|알림|리마인드).*(뭐|목록|있어|있
 REMIND_REQUEST = re.compile(r"알려|리마인드|깨워|잊지 않게|까먹지 않게|기억해|저장해|등록해|챙겨 ?줘|말해 ?줘")
 
 
+def tools_text():
+    return "\n".join(f"- {name}: {t['desc']}. 인자 {t['args']}" for name, t in TOOLS.items())
+
+
 def router_prompt():
-    tools = "\n".join(f"- {name}: {t['desc']}. 인자 {t['args']}" for name, t in TOOLS.items())
+    """코드에 남겨 둔 기본 지시문. Langfuse 에서 가져오지 못하거나 Langfuse 키가 없을 때 이것으로 고른다."""
+    return router_template().replace("{{tools}}", tools_text())
+
+
+def router_template():
+    """Langfuse 프롬프트 router 버전 1의 원본. 도구 목록은 {{tools}} 로 비워 두고 서비스가 채운다."""
     return "\n".join([
         "너는 AI 친구 서비스에서 사용자 메시지에 답하기 전에 필요한 도구를 고르는 선택기다.",
         "쓸 수 있는 도구:",
-        tools,
+        "{{tools}}",
         "",
         "규칙:",
         "- 도구가 필요 없는 일상 대화면 tools 를 빈 배열로 둔다. 대부분의 메시지는 여기에 해당한다.",
@@ -53,6 +65,40 @@ def router_prompt():
     ])
 
 
+def prompt_label():
+    """서비스가 가져올 라벨. 운영(ENV=production)은 production, 그 밖(local, staging)은 staging."""
+    return "production" if os.environ.get("ENV", "").strip() == "production" else "staging"
+
+
+def ab_variant(user_id):
+    """AB_TEST=on 일 때 사용자 ID 로 정한 그룹 'a' 또는 'b'. 꺼져 있거나 사용자 ID 가 없으면 None.
+    sha256 으로 0~99 를 만든다(파이썬 hash() 는 서버를 다시 띄우면 값이 바뀐다). 같은 사용자는 늘 같은 그룹이다.
+    AB_SPLIT(기본 50)보다 작으면 a. B 를 10%로 시작하려면 AB_SPLIT=90."""
+    if os.environ.get("AB_TEST", "off").strip().lower() != "on" or not user_id:
+        return None
+    bucket = int(hashlib.sha256(str(user_id).encode()).hexdigest(), 16) % 100
+    return "a" if bucket < int(os.environ.get("AB_SPLIT", "50")) else "b"
+
+
+def load_prompt(label=None, variant=None):
+    """Langfuse 프롬프트 관리에서 router 를 라벨로 가져온다. Langfuse 키가 없으면 None(코드 문장을 쓴다).
+    A/B 그룹이 있으면 prod-a / prod-b 라벨을 가져오고, 가져오지 못하면 production 라벨로 대신한다.
+    production 도 가져오지 못하면 SDK 가 코드 문장으로 만든 대체 프롬프트(is_fallback=True)를 돌려준다.
+    근거: langfuse 5.1.0 Langfuse.get_prompt(name, label=, fallback=). 가져온 프롬프트는 SDK 가 60초 동안 캐시한다.
+    A/B 라벨 근거: https://langfuse.com/docs/prompt-management/features/a-b-testing"""
+    try:
+        if variant and not label:
+            prompt = tracing.get_prompt(ROUTER_PROMPT, f"prod-{variant}", fallback=router_template())
+            if prompt is None or not prompt.is_fallback:
+                return prompt
+            log("WARNING", "A/B 라벨 프롬프트를 가져오지 못해 production 으로 고름", variant=variant)
+            label = "production"
+        return tracing.get_prompt(ROUTER_PROMPT, label or prompt_label(), fallback=router_template())
+    except Exception as error:
+        log("WARNING", "router 프롬프트를 가져오지 못해 코드 문장으로 고름", error=type(error).__name__)
+        return None
+
+
 @dataclass
 class ToolChoice:
     tools: list                          # [{"name": ..., "args": {...}}]
@@ -61,6 +107,8 @@ class ToolChoice:
     decided_by: str                      # model, rule
     action: str = "answer"               # answer, clarify
     guards: list = field(default_factory=list)
+    prompt: str = "code"                 # 고를 때 쓴 지시문: router v1, code(코드 문장)
+    ab_variant: str = None               # A/B 테스트 그룹 a, b. 꺼져 있으면 None
 
 
 # ── 키워드 규칙 ─────────────────────────────────────────────────────
@@ -116,17 +164,24 @@ def rule_choose(message, now, location):
 
 # ── 모델 ────────────────────────────────────────────────────────────
 
-def model_choose(message, history, now, location, llm):
+def model_choose(message, history, now, location, llm, label=None, user_id=None):
     recent = "\n".join(f"{m['role']}: {m['content']}" for m in history[-4:]) or "(없음)"
     user = (f"[지금] {now.isoformat()} ({when.WEEKDAYS[now.weekday()]}요일)\n[달력]\n{when.calendar_hint(now)}\n"
             f"[사용자 지역] {location}\n[최근 대화]\n{recent}\n\n[메시지]\n{message}")
-    data = llm.complete_json(router_prompt(), user)
+    variant = ab_variant(user_id)
+    prompt = load_prompt(label, variant)
+    system = prompt.compile(tools=tools_text()) if prompt else router_prompt()
+    data = llm.complete_json(system, user)
+    if prompt and not prompt.is_fallback:
+        tracing.update_generation(prompt=prompt)   # 트레이스의 도구 선택 단계에 프롬프트 이름과 버전이 보인다
     tools = []
     for t in data.get("tools") or []:
         if isinstance(t, dict) and t.get("name") in TOOLS:
             tools.append({"name": t["name"], "args": t.get("args") if isinstance(t.get("args"), dict) else {}})
     confidence = max(0.0, min(1.0, float(data.get("confidence", 0))))
-    result = ToolChoice(tools[:MAX_TOOLS], confidence, str(data.get("reason", "")), "model")
+    result = ToolChoice(tools[:MAX_TOOLS], confidence, str(data.get("reason", "")), "model",
+                        prompt=f"{ROUTER_PROMPT} v{prompt.version}" if prompt and not prompt.is_fallback else "code",
+                        ab_variant=variant)
 
     # 안전장치: 지난 연도로 적힌 날짜는 올해로 고친다
     for t in result.tools:
@@ -143,10 +198,10 @@ def model_choose(message, history, now, location, llm):
     return result
 
 
-def choose(message, history, now, location, llm):
+def choose(message, history, now, location, llm, user_id=None):
     if getattr(llm, "can_reason", False):
         try:
-            result = model_choose(message, history, now, location, llm)
+            result = model_choose(message, history, now, location, llm, user_id=user_id)
         except Exception as error:  # 모델 응답이 형식에 맞지 않으면 규칙으로 대신한다
             log("WARNING", "모델 도구 선택 실패, 키워드 규칙으로 대신함", error=type(error).__name__)
             result = rule_choose(message, now, location)
@@ -161,5 +216,5 @@ def choose(message, history, now, location, llm):
         result.tools = []
 
     log("INFO", "도구 선택", tools=[t["name"] for t in result.tools], confidence=round(result.confidence, 2),
-        decided_by=result.decided_by, action=result.action)
+        decided_by=result.decided_by, action=result.action, prompt=result.prompt, ab_variant=result.ab_variant)
     return result

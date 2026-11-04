@@ -147,6 +147,40 @@ def holidays_of(year):
     return _holiday_cache[year]
 
 
+DAY_COUNT = {3: "사흘", 4: "나흘", 5: "닷새", 6: "엿새", 7: "이레"}
+
+
+def is_day_off(d):
+    return d.weekday() >= 5 or any(h == d for h, _ in holidays_of(d.year))
+
+
+def holiday_break(d):
+    """공휴일 d 를 앞뒤의 주말, 다른 공휴일과 이어 붙인 쉬는 기간 (첫날, 마지막 날).
+    모델은 '금요일 공휴일이면 사흘'을 지시문으로 알려 줘도 날짜를 틀리게 세서, 계산은 코드가 한다."""
+    first = last = d
+    while is_day_off(first - timedelta(days=1)):
+        first -= timedelta(days=1)
+    while is_day_off(last + timedelta(days=1)):
+        last += timedelta(days=1)
+    return first, last
+
+
+def break_label(first, last):
+    days = (last - first).days + 1
+    end = f"{last.day}일({when.WEEKDAYS[last.weekday()]})" if last.month == first.month else when.date_label(last)
+    return f"{when.date_label(first)}~{end} {DAY_COUNT.get(days, f'{days}일')}"
+
+
+def breaks_of(days):
+    """공휴일 목록에서 3일 이상 이어 쉬는 기간만 겹치지 않게 모은다."""
+    found = []
+    for d in days:
+        first, last = holiday_break(d)
+        if (last - first).days >= 2 and (first, last) not in found:
+            found.append((first, last))
+    return found
+
+
 def get_holidays(args, ctx):
     today = when.now_in(ctx.timezone).date()
     try:
@@ -157,13 +191,27 @@ def get_holidays(args, ctx):
     found = []
     for year in range(start.year, end.year + 1):
         found += [(d, n) for d, n in holidays_of(year) if start <= d <= end]
+    breaks = breaks_of([d for d, _ in found])
     data = {"from": start.isoformat(), "to": end.isoformat(),
-            "holidays": [{"date": d.isoformat(), "name": n} for d, n in found]}
+            "holidays": [{"date": d.isoformat(), "name": n} for d, n in found],
+            "breaks": [{"from": f.isoformat(), "to": t.isoformat(), "days": (t - f).days + 1} for f, t in breaks]}
     if not found:
-        return ToolResult("get_holidays", True, f"{start}부터 {end}까지 공휴일이 없습니다.", data)
+        # 기간 안에 없으면 그 뒤 1년 안의 첫 공휴일을 함께 알려 준다. 빈칸이 있으면 모델이 날짜를 지어낸다.
+        later = [(d, n) for year in (end.year, end.year + 1) for d, n in holidays_of(year)
+                 if end < d <= end + timedelta(days=365)]
+        summary = f"{start}부터 {end}까지 공휴일이 없습니다."
+        if later:
+            d, n = later[0]
+            data["next"] = {"date": d.isoformat(), "name": n}
+            nxt = breaks_of([d])
+            summary += f" 그 뒤 첫 공휴일: {when.date_label(d)} {n}" + (f", 연휴 {break_label(*nxt[0])}." if nxt else ".")
+        return ToolResult("get_holidays", True, summary, data)
     listed = ", ".join(f"{when.date_label(d)} {n}" for d, n in found[:6])
     more = f" 외 {len(found) - 6}일" if len(found) > 6 else ""
-    return ToolResult("get_holidays", True, f"{start}~{end} 공휴일: {listed}{more}.", data)
+    summary = f"{start}~{end} 공휴일: {listed}{more}."
+    if breaks:
+        summary += " 주말과 이어 쉬는 연휴: " + ", ".join(break_label(f, t) for f, t in breaks[:4]) + "."
+    return ToolResult("get_holidays", True, summary, data)
 
 
 # ── 약속 도구 ──────────────────────────────────────────────────────
