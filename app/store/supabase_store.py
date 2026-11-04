@@ -138,6 +138,33 @@ class SupabaseStore:
                             user_id=f"eq.{uid}", status="eq.pending", due_at=f"lte.{iso(now)}")
         return [self._reminder(r) for r in rows]
 
+    # 크레딧 원장(supabase/migrations/0002_credits.sql)
+    def _rpc(self, name, **args):
+        r = self.http.post(f"/rpc/{name}", json=args)
+        r.raise_for_status()
+        return r.json()
+
+    def credit_balance(self, uid):
+        return self._rpc("credit_balance", p_user=uid) or 0
+
+    def add_credit(self, uid, delta, reason, ref):
+        """+ 또는 - 줄 하나를 쌓는다. ref 가 유일해서 같은 ref 가 이미 있으면 쌓지 않고 False."""
+        r = self.http.post("/credit_ledger", params={"on_conflict": "ref"},
+                           json={"user_id": uid, "delta": delta, "reason": reason, "ref": ref},
+                           headers={"Prefer": "return=representation,resolution=ignore-duplicates"})
+        r.raise_for_status()
+        return bool(r.json())
+
+    def spend_credit(self, uid, ref, amount=1):
+        """데이터베이스 함수가 잠금을 걸고 잔액 확인과 - 줄 기록을 한 번에 한다. 모자라면 None."""
+        return self._rpc("spend_credit", p_user=uid, p_ref=ref, p_amount=amount)
+
+    def credit_history(self, uid, limit=10):
+        rows = self._get("credit_ledger", user_id=f"eq.{uid}", order="id.desc", limit=limit,
+                         select="id,delta,reason,ref,created_at")
+        return [{**row, "created_at": parse_time(row["created_at"])} for row in rows]
+
     def delete_all(self, uid):
+        # 크레딧 원장은 지우지 않는다(지우면 무료 크레딧을 다시 받을 수 있다)
         for table in ("messages", "summaries", "memories", "reminders", "characters", "user_settings"):
             self._delete(table, user_id=f"eq.{uid}")

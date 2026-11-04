@@ -21,6 +21,7 @@ class MemoryStore:
         self.lock = threading.Lock()
         self.ids = itertools.count(1)
         self.users = {}
+        self.ledger = []  # 크레딧 원장. 사용자 데이터 삭제(delete_all)와 따로 둔다
 
     def _user(self, uid):
         return self.users.setdefault(uid, {
@@ -112,5 +113,36 @@ class MemoryStore:
                     claimed.append(dict(r))
         return claimed
 
+    # 크레딧 원장. 잔액은 delta 의 합이고, ref 가 같은 줄은 두 번 쌓지 않는다
+    def _balance(self, uid):
+        return sum(row["delta"] for row in self.ledger if row["user_id"] == uid)
+
+    def credit_balance(self, uid):
+        with self.lock:
+            return self._balance(uid)
+
+    def add_credit(self, uid, delta, reason, ref):
+        """+ 또는 - 줄 하나를 쌓는다. 같은 ref 가 이미 있으면 쌓지 않고 False."""
+        with self.lock:
+            if any(row["ref"] == ref for row in self.ledger):
+                return False
+            self.ledger.append({"id": next(self.ids), "user_id": uid, "delta": delta, "reason": reason,
+                                "ref": ref, "created_at": utcnow()})
+            return True
+
+    def spend_credit(self, uid, ref, amount=1):
+        """잔액 확인과 - 줄 기록을 잠금 안에서 한 번에 한다. 모자라면 None, 성공하면 차감 뒤 잔액."""
+        with self.lock:
+            balance = self._balance(uid)
+            if balance < amount:
+                return None
+            self.ledger.append({"id": next(self.ids), "user_id": uid, "delta": -amount, "reason": "message",
+                                "ref": ref, "created_at": utcnow()})
+            return balance - amount
+
+    def credit_history(self, uid, limit=10):
+        rows = [dict(row) for row in self.ledger if row["user_id"] == uid]
+        return list(reversed(rows))[:limit]
+
     def delete_all(self, uid):
-        self.users.pop(uid, None)
+        self.users.pop(uid, None)  # 크레딧 원장은 지우지 않는다(지우면 무료 크레딧을 다시 받을 수 있다)

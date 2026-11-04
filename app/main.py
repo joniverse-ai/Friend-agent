@@ -4,7 +4,8 @@
 - /health, /version: 서비스 상태와 배포 버전
 - /api/config: 화면이 쓰는 설정(로그인 방식, 개발용 패널 표시 여부)
 - /api/character, /api/settings: 캐릭터와 사용자 설정
-- /api/chat: 메시지 한 턴. 결과를 이벤트(JSON 한 줄씩)로 스트리밍한다
+- /api/chat: 메시지 한 턴. 결과를 이벤트(JSON 한 줄씩)로 스트리밍한다. 받자마자 1크레딧 차감, 모자라면 402
+- /api/credits: 크레딧 잔액과 최근 기록 10줄
 - /api/greeting: 앱을 열 때 먼저 말 걸기
 - /api/ocr: 사진 속 글자 읽기(OCR_ENABLED=true 일 때)
 - /api/pdf: PDF 공지문 글자 읽기(PDF_ENABLED=true 일 때)
@@ -19,12 +20,13 @@ from fastapi import Depends, FastAPI, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app import agent, ocr, pdf, tracing, when
+from app import agent, credits, ocr, pdf, tracing, when
 from app.auth import Auth, User
 from app.config import ROOT, load_settings
 from app.llm import make_llm
 from app.logs import log
 from app.persona import DEFAULT_CHARACTER, OPTIONS, build_persona, clean_character
+from app.safety import is_crisis
 from app.store.base import make_store
 from app.tools import CITIES
 
@@ -111,8 +113,18 @@ def config():
 
 @app.get("/api/me")
 def me(user: User = Depends(current_user)):
+    if credits.grant_signup(store, user.id):  # 처음 온 사용자에게 무료 크레딧(한 번만 쌓인다)
+        log("INFO", "가입 무료 크레딧 지급", credits=credits.FREE_CREDITS)
     return {"id": user.id, "anonymous": user.anonymous, "email": user.email,
-            "has_character": store.get_character(user.id) is not None}
+            "has_character": store.get_character(user.id) is not None,
+            "credits": store.credit_balance(user.id)}
+
+
+@app.get("/api/credits")
+def my_credits(user: User = Depends(current_user)):
+    return {"balance": store.credit_balance(user.id),
+            "history": [{"delta": r["delta"], "reason": r["reason"], "created_at": r["created_at"].isoformat()}
+                        for r in store.credit_history(user.id, 10)]}
 
 
 # ── 캐릭터와 설정 ──────────────────────────────────────────────────
@@ -168,12 +180,24 @@ def chat(req: ChatRequest, user: User = Depends(current_user), model=Depends(get
     if not message:
         raise HTTPException(400, "메시지가 비어 있습니다")
 
+    # 크레딧: 답을 만들기 전에, 받자마자 서버에서 차감한다. 위기 표현은 차감하지 않고 안전 응답으로 보낸다.
+    charge = None
+    if not is_crisis(message):
+        charge, balance = credits.charge_message(store, user.id)
+        if charge is None:
+            log("INFO", "크레딧 부족으로 메시지 거절")
+            return JSONResponse(credits.NO_CREDITS, status_code=402)
+
     def events():
         try:
+            if charge:
+                yield json.dumps({"type": "credits", "balance": balance}) + "\n"
             for event in agent.run_turn(message, user.id, model, store, settings.show_turn_panel):
                 yield json.dumps(event, ensure_ascii=False, default=str) + "\n"
         except Exception as error:
             log("ERROR", "대화 처리 실패", error=type(error).__name__)
+            if charge and credits.refund_message(store, user.id, charge):
+                log("INFO", "실패한 메시지 크레딧 되돌림")
             yield json.dumps({"type": "error", "message": "답을 만들지 못했어요. 잠시 뒤 다시 보내 주세요."}, ensure_ascii=False) + "\n"
         finally:
             tracing.flush()  # 응답을 닫기 전에 트레이스를 보낸다(Cloud Run 은 응답 뒤 CPU를 거의 주지 않는다)
