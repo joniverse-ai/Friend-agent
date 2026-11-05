@@ -38,6 +38,7 @@ class Settings:
     google_login: bool
     show_turn_panel: bool
     ocr_enabled: bool
+    ocr_engine: str           # tesseract(기본), vision
     pdf_enabled: bool
     toss_client_key: str      # 결제위젯용 클라이언트 키(test_gck_…). 화면에 보내도 되는 값
     toss_secret_key: str      # 결제 승인용 시크릿 키(test_gsk_…). 서버만 쓰고 화면, 로그에 남기지 않는다
@@ -114,6 +115,8 @@ def load_settings():
         # 개발용 "이번 턴" 패널. production 에서는 기본으로 끈다.
         show_turn_panel=env_flag("SHOW_TURN_PANEL", env != "production"),
         ocr_enabled=env_flag("OCR_ENABLED", False),  # 사진 글자 읽기. tesseract 프로그램이 필요하다
+        # 사진 글자 읽기 엔진. vision 은 Google Cloud Vision(Cloud Run 에서만), 그 밖의 값은 tesseract
+        ocr_engine="vision" if os.environ.get("OCR_ENGINE", "").strip().lower() == "vision" else "tesseract",
         pdf_enabled=env_flag("PDF_ENABLED", False),  # PDF 공지문 글자 읽기. pdftotext(poppler) 프로그램이 필요하다
         # 두 키가 다 있을 때만 결제를 켠다. 없으면 크레딧은 쓰되 살 수는 없다
         toss_client_key=os.environ.get("TOSS_CLIENT_KEY", "").strip(),
