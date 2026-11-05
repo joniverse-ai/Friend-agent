@@ -21,6 +21,7 @@ import time
 import uuid
 
 from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -352,7 +353,9 @@ async def read_photo(photo: UploadFile, user: User = Depends(current_user)):
     if not settings.ocr_enabled:
         raise HTTPException(404, "사진 글자 읽기가 꺼져 있습니다")
     try:
-        return {"text": ocr.read_text(await photo.read())}
+        # 글자 읽기는 몇 초 걸릴 수 있어, 다른 사용자의 대화가 멈추지 않도록 별도 스레드에서 돌린다
+        data = await photo.read()
+        return {"text": await run_in_threadpool(ocr.read_text, data, settings.ocr_engine)}
     except ocr.OcrError as error:
         raise HTTPException(500, str(error)) from error
 
