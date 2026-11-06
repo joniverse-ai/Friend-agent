@@ -5,6 +5,7 @@ Claude는 Anthropic SDK로 따로 부른다. 앱 안에서 쓰는 메시지 형�
 fake 는 키 없이 화면과 흐름을 확인하거나 테스트할 때 쓰는 가짜 응답이다.
 세 클래스 모두 호출이 끝나면 모델 이름과 입력·출력 토큰 수를 트레이스에 적는다(비용 계산용).
 """
+import base64
 import json
 import re
 import time
@@ -40,6 +41,23 @@ class OpenAICompatibleLLM:
         response = self.client.chat.completions.create(model=self.model, messages=messages)
         self._record(response)
         return response.choices[0].message.content.strip()
+
+    def complete_vision_json(self, system, user, image=None, model=None):
+        """그림 한 장(있으면)과 글을 함께 보내 JSON 하나를 받는다. image 는 (bytes, mime)."""
+        content = [{"type": "text", "text": user}]
+        if image:
+            data, mime = image
+            url = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+            content.append({"type": "image_url", "image_url": {"url": url, "detail": "high"}})
+        response = self.client.chat.completions.create(
+            model=model or self.model,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
+            response_format={"type": "json_object"},
+            # max_tokens 대신 이 이름을 쓴다. 생각하는 모델(QUIZ_MODEL 로 바꿀 때)도 받는 이름이다
+            max_completion_tokens=2000,
+        )
+        self._record(response)
+        return json.loads(response.choices[0].message.content)
 
     def chat_stream(self, messages):
         """답을 만들어지는 대로 조금씩 돌려준다(스트리밍)."""
@@ -124,6 +142,24 @@ class ClaudeLLM:
         self._record(response)
         return self._text(response)
 
+    def complete_vision_json(self, system, user, image=None, model=None):
+        """그림 한 장(있으면)과 글을 함께 보내 JSON 하나를 받는다. image 는 (bytes, mime)."""
+        system = system + "\n\n반드시 JSON 객체 하나만 출력한다. 설명이나 코드 블록 표시는 붙이지 않는다."
+        content = []
+        if image:
+            data, mime = image
+            content.append({"type": "image", "source": {"type": "base64", "media_type": mime,
+                                                         "data": base64.b64encode(data).decode("ascii")}})
+        content.append({"type": "text", "text": user})
+        request = self._request(system, [{"role": "user", "content": content}])
+        if model:
+            request["model"] = model
+        response = self.client.beta.messages.create(**request)
+        self._record(response)
+        if response.stop_reason == "refusal":
+            raise ValueError("Claude가 요청을 거절했습니다.")
+        return parse_json_object(self._text(response))
+
     def chat_stream(self, messages):
         """답을 만들어지는 대로 조금씩 돌려준다(스트리밍)."""
         system, turns = self.to_claude(messages)
@@ -183,6 +219,13 @@ class FakeLLM:
     def complete_text(self, messages):
         record_usage(self.model, 0, 0)
         return self._reply(messages)
+
+    def complete_vision_json(self, system, user, image=None, model=None):
+        """퀴즈 풀이 흉내. 객관식이면 늘 1번, 단답형이면 정해진 글을 고른다."""
+        record_usage(self.model, 0, 0)
+        if "객관식" in user:
+            return {"choice": 1, "reason": "(가짜 응답) 첫 번째 보기를 골랐어요."}
+        return {"text": "가짜답", "reason": "(가짜 응답) 정해진 답을 썼어요."}
 
     def chat_stream(self, messages):
         record_usage(self.model, 0, 0)
