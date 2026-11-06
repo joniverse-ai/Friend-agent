@@ -9,6 +9,7 @@
 - 문제와 답은 로그에 남기지 않는다. 종류, 걸린 시간, 모델만 남긴다.
 """
 import base64
+import io
 import json
 import os
 import threading
@@ -98,36 +99,75 @@ def decode_photo(photo):
     return data
 
 
+# ---- 사진 손질 ----
+PHOTO_LONG_EDGE = 1600
+
+
+def enhance_photo(data):
+    """앱이 찍은 퀴즈 화면 사진을 AI가 읽기 좋게 손질해 JPEG bytes 로 돌려준다.
+
+    - 폰의 회전 정보대로 바로 세운다
+    - 긴 변을 1600px 로 맞춘다(크면 줄여 전송·판독 시간을 줄이고, 글자는 읽힐 만큼 남긴다)
+    - 색은 그대로 두고 대비를 높인다. "빨간색 원" 처럼 색을 봐야 하는 그림 문제가 있어 흑백으로 바꾸지 않는다
+    - 모니터를 찍어 흐릿해진 글자 테두리를 선명하게 한다
+    """
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
+
+    try:
+        image = Image.open(io.BytesIO(data))
+        image = ImageOps.exif_transpose(image).convert("RGB")
+    except (UnidentifiedImageError, OSError) as error:
+        raise QuizError(400, "사진 파일을 읽을 수 없습니다.") from error
+    scale = PHOTO_LONG_EDGE / max(image.size)
+    if scale < 1:
+        image = image.resize((round(image.width * scale), round(image.height * scale)), Image.LANCZOS)
+    image = ImageOps.autocontrast(image, cutoff=1)  # 가장 어두운·밝은 1%를 검정·흰색으로 펴서 대비를 높인다
+    image = ImageEnhance.Contrast(image).enhance(1.25)
+    image = image.filter(ImageFilter.UnsharpMask(radius=2, percent=120, threshold=3))
+    out = io.BytesIO()
+    image.save(out, "JPEG", quality=88)
+    return out.getvalue()
+
+
 # ---- 지시문 ----
-SYSTEM = """너는 퀴즈 대결에 나간 에이전트다. 빠르고 정확하게 정답 하나를 고른다.
+SYSTEM = """너는 퀴즈 대결에 나간 에이전트다. 정확하게 정답 하나를 고른다.
 퀴즈 범위는 일반 상식, 코딩, 이미지 해석이다.
 
-반드시 아래 JSON 객체 하나만 출력한다.
-- 객관식: {"choice": 화면에 보이는 보기 번호(1부터 세는 정수), "reason": "고른 이유"}
-- 단답형: {"text": "답", "reason": "고른 이유"}
+반드시 아래 순서의 JSON 객체 하나만 출력한다.
+{
+  "read": {"question": "읽은 문제 글", "choices": ["보기1", "보기2", ...]},
+  "think": "답을 구하는 짧은 풀이 과정(계산, 그림에서 센 개수 등)",
+  "choice": 객관식이면 보기 번호(화면처럼 1부터 세는 정수),
+  "text": 단답형이면 답,
+  "reason": "고른 이유"
+}
 
 규칙:
+- read: 문제 글과 보기를 화면(또는 문제 데이터)에 있는 그대로 옮겨 적는다. 단답형이면 choices 는 빈 목록이다.
+  사진이면 글자를 한 글자씩 꼼꼼히 읽는다. 문제와 관계없는 화면 요소(팀 목록, 점수, 타이머, QR, 브라우저 주소창)는 무시한다.
+- think: 바로 답하지 말고 먼저 푼다. 개수를 세는 그림 문제는 하나씩 세어 적고, 계산 문제는 식을 적는다.
+- 객관식은 choice 만, 단답형은 text 만 채운다.
+- text 에는 답만 쓴다. 문제가 요구한 형식(예: "숫자로 답하세요" 면 숫자만)을 그대로 따른다. 문장이나 설명을 붙이지 않는다.
 - reason 은 한국어 한두 문장으로 짧게 쓴다. 대회 화면에 공개된다.
-- 단답형 text 에는 답만 쓴다. 문제가 요구한 형식(숫자만인지, 단위를 붙이는지, 영어인지)을 그대로 따른다.
-  "7" 과 "7개" 는 다른 답이다. 문장이나 설명을 붙이지 않는다.
-- 확실하지 않아도 가장 그럴듯한 답 하나를 반드시 고른다. 답을 비워 두지 않는다.
-- 사진이 함께 오면 사진 속 퀴즈 화면에서 문제와 보기를 직접 읽는다. 문제와 관계없는 화면 요소(점수, 타이머, QR)는 무시한다."""
+- 확실하지 않아도 가장 그럴듯한 답 하나를 반드시 고른다."""
 
 
 def build_prompt(question, has_image):
     kind = question.get("type")
     lines = []
     if question.get("hidden"):
-        lines.append("하드모드다. 문제 글이 오지 않았으니 함께 보낸 사진(퀴즈 화면을 찍은 것)에서 문제를 읽어라.")
+        lines.append("하드모드다. 문제 글이 오지 않았으니 함께 보낸 사진(노트북 화면에 띄운 퀴즈 화면을 폰으로 찍은 것)에서 문제와 보기를 읽어라.")
+        if question.get("mode") == "image":
+            lines.append("그림 문제다. 사진 속 퀴즈 화면에 있는 그림(차트, 도형 등)을 자세히 보고 푼다. 색깔, 막대 높이, 개수를 꼼꼼히 확인한다.")
         if kind == "choice":
-            lines.append(f"객관식이고 보기는 {question.get('choice_count', '?')}개다. 화면의 보기 번호(1부터)로 답한다.")
+            lines.append(f"객관식이고 보기는 {question.get('choice_count', '?')}개다. 화면에 보이는 보기 번호(1부터)로 choice 를 쓴다.")
         elif kind == "short":
             lines.append("단답형이다. text 에 답을 쓴다.")
         else:
             lines.append("객관식이면 choice, 단답형이면 text 로 답한다.")
     else:
         # 필드 이름이 바뀌어도 풀 수 있게 문제 데이터를 통째로 넘긴다(그림 주소, 정답 관련 값은 뺀다)
-        shown = {k: v for k, v in question.items() if k not in ("image_url", "answer", "correct")}
+        shown = {k: v for k, v in question.items() if k not in ("image_url", "answer", "answers", "correct")}
         lines.append("문제 데이터(JSON): " + json.dumps(shown, ensure_ascii=False))
         choices = question.get("choices") or []
         if kind == "choice" or choices:
@@ -137,8 +177,15 @@ def build_prompt(question, has_image):
         else:
             lines.append("단답형이다. text 에 답을 쓴다.")
         if has_image:
-            lines.append("문제에 딸린 그림을 함께 보낸다. 그림을 보고 푼다.")
+            lines.append("문제에 딸린 그림을 함께 보낸다. 그림을 자세히 보고 푼다. 색깔, 막대 높이, 개수를 꼼꼼히 확인한다.")
     return "\n".join(lines)
+
+
+def read_of(result):
+    """모델이 옮겨 적은 문제와 보기. 앱 화면에 보여 줘 인식이 맞았는지 확인하게 한다(로그에는 남기지 않는다)."""
+    read = result.get("read") if isinstance(result.get("read"), dict) else {}
+    choices = read.get("choices") if isinstance(read.get("choices"), list) else []
+    return {"question": str(read.get("question") or "")[:500], "choices": [str(c)[:120] for c in choices][:10]}
 
 
 def choice_count(question):
@@ -152,7 +199,7 @@ def to_answer(question, result):
     """모델 답을 퀴즈 서버 형식으로. 객관식은 0부터 세는 choice."""
     reason = str(result.get("reason") or "").strip()[:300] or "에이전트가 고른 답"
     kind = question.get("type")
-    if kind == "short" or (kind != "choice" and "text" in result and "choice" not in result):
+    if kind == "short" or (kind != "choice" and result.get("text") and result.get("choice") is None):
         text = str(result.get("text") or "").strip()
         if not text:
             raise QuizError(502, "에이전트가 답을 만들지 못했습니다.")
@@ -183,6 +230,7 @@ def solve(llm, question, image=None, model=None):
         log("ERROR", "퀴즈 풀이 실패", error=type(error).__name__)
         raise QuizError(502, "에이전트가 답을 만들지 못했습니다.") from error
     answer = to_answer(question, result)
+    answer["read"] = read_of(result)
     ms = int((time.monotonic() - started) * 1000)
     log("INFO", "퀴즈 풀이", type=question.get("type"), hidden=bool(question.get("hidden")),
         image=image is not None, ms=ms, model=model or getattr(llm, "model", ""))
