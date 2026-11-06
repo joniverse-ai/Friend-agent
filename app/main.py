@@ -10,6 +10,7 @@
 - /api/greeting: 앱을 열 때 먼저 말 걸기
 - /api/ocr: 사진 속 글자 읽기(OCR_ENABLED=true 일 때)
 - /api/pdf: PDF 공지문 글자 읽기(PDF_ENABLED=true 일 때)
+- /api/quiz/solve: 퀴즈 대결 앱의 문제 풀이(답과 이유). 답 제출은 앱이 퀴즈 서버에 직접 한다
 - /api/memories, /api/reminders, /api/data: 기억, 약속, 내 데이터 관리
 """
 import html
@@ -25,7 +26,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app import agent, credits, ocr, payments, pdf, tracing, when
+from app import agent, credits, ocr, payments, pdf, quiz, tracing, when
 from app.auth import Auth, User
 from app.config import ROOT, load_settings
 from app.llm import make_llm
@@ -113,6 +114,12 @@ class ConfirmRequest(BaseModel):
 
 class FailRequest(BaseModel):
     code: str = ""
+
+
+class QuizSolveRequest(BaseModel):
+    question: dict              # 퀴즈 서버 /api/question 의 question 그대로
+    server_url: str | None = None  # 그림 문제(mode=image)일 때 그림을 받아 올 퀴즈 서버 주소
+    photo: str | None = None       # 하드모드: 앱이 찍은 퀴즈 화면 사진(base64 JPEG)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -358,6 +365,24 @@ async def read_photo(photo: UploadFile, user: User = Depends(current_user)):
         return {"text": await run_in_threadpool(ocr.read_text, data, settings.ocr_engine)}
     except ocr.OcrError as error:
         raise HTTPException(500, str(error)) from error
+
+
+@app.post("/api/quiz/solve")
+def solve_quiz(req: QuizSolveRequest, user: User = Depends(current_user)):
+    """퀴즈 대결 앱이 문제를 보내면 답과 이유를 돌려준다. 답 제출은 앱이 퀴즈 서버에 직접 한다.
+
+    LLM 키를 앱에 두지 않으려고 풀이만 서버가 맡는다. 크레딧은 빼지 않고, 사용자당 1분 요청 수만 제한한다.
+    """
+    try:
+        quiz.check_rate(user.id)
+        image = None
+        if req.photo:
+            image = (quiz.decode_photo(req.photo), "image/jpeg")
+        elif req.question.get("mode") == "image" and req.question.get("image_url") and not req.question.get("hidden"):
+            image = quiz.fetch_image(req.server_url, req.question["image_url"])
+        return quiz.solve(get_llm(), req.question, image, model=quiz.quiz_model(settings.model))
+    except quiz.QuizError as error:
+        raise HTTPException(error.status, str(error)) from error
 
 
 @app.post("/api/pdf")
