@@ -377,7 +377,8 @@ def solve_quiz(req: QuizSolveRequest, user: User = Depends(current_user)):
         quiz.check_rate(user.id)
         image = None
         if req.photo:
-            image = (quiz.decode_photo(req.photo), "image/jpeg")
+            # 모니터를 찍은 사진이라 흐리고 대비가 낮다. AI에게 보내기 전에 대비를 높이고 선명하게 손질한다
+            image = (quiz.enhance_photo(quiz.decode_photo(req.photo)), "image/jpeg")
         elif req.question.get("mode") == "image" and req.question.get("image_url") and not req.question.get("hidden"):
             image = quiz.fetch_image(req.server_url, req.question["image_url"])
         return quiz.solve(get_llm(), req.question, image, model=quiz.quiz_model(settings.model))

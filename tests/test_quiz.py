@@ -1,5 +1,6 @@
 """퀴즈 풀이 API 시험. 가짜 LLM(늘 1번 보기, 단답은 '가짜답')과 가짜 모델로 돌려 실제 AI를 부르지 않는다."""
 import base64
+import io
 
 import httpx
 import pytest
@@ -46,8 +47,16 @@ def test_hidden_question_needs_photo():
     assert r.status_code == 400
 
 
+def jpeg(size=(400, 300), color=(200, 40, 40)):
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.new("RGB", size, color).save(out, "JPEG")
+    return out.getvalue()
+
+
 def test_hidden_question_with_photo():
-    photo = base64.b64encode(b"\xff\xd8\xff fake jpeg").decode()
+    photo = base64.b64encode(jpeg()).decode()
     r = solve(question={"id": 5, "type": "choice", "hidden": True, "choice_count": 4}, photo=photo)
     assert r.status_code == 200
     assert r.json()["choice"] == 0
@@ -133,3 +142,50 @@ def test_quiz_model_setting(monkeypatch):
     assert quiz.quiz_model("gpt-4o-mini") == "gpt-4o-mini"
     monkeypatch.setenv("QUIZ_MODEL", "gpt-4.1-mini")
     assert quiz.quiz_model("gpt-4o-mini") == "gpt-4.1-mini"
+
+
+def test_not_an_image_photo_is_400():
+    photo = base64.b64encode(b"not a picture").decode()
+    r = solve(question={"id": 5, "type": "choice", "hidden": True, "choice_count": 4}, photo=photo)
+    assert r.status_code == 400
+
+
+def test_enhance_photo_shrinks_keeps_color_and_raises_contrast():
+    from PIL import Image, ImageDraw
+
+    big = Image.new("RGB", (4000, 3000), (120, 120, 120))
+    ImageDraw.Draw(big).rectangle([100, 100, 900, 900], fill=(150, 60, 60))  # 흐린 빨강
+    raw = io.BytesIO()
+    big.save(raw, "JPEG")
+    out = Image.open(io.BytesIO(quiz.enhance_photo(raw.getvalue())))
+    assert max(out.size) == quiz.PHOTO_LONG_EDGE
+    r, g, b = out.getpixel((100, 100))  # 빨강 영역(1600/4000 비율로 줄어든 자리)
+    assert r > g + 60  # 흑백으로 바꾸지 않고 색을 살린다
+    lo, hi = out.convert("L").getextrema()
+    assert hi - lo > 100  # 대비가 펴졌다
+
+
+def test_read_is_returned_for_screen_check():
+    class ReadLLM:
+        model = "t"
+
+        def complete_vision_json(self, system, user, image=None, model=None):
+            return {"read": {"question": "1+1은?", "choices": ["1", "2"]}, "think": "1+1=2", "choice": 2, "reason": "2"}
+
+    answer = quiz.solve(ReadLLM(), {"id": "t1", "type": "choice", "hidden": True, "choice_count": 2}, image=(b"x", "image/jpeg"))
+    assert answer["choice"] == 1
+    assert answer["read"] == {"question": "1+1은?", "choices": ["1", "2"]}
+
+
+def test_answers_are_not_shown_to_model():
+    seen = []
+
+    class ShortLLM:
+        model = "t"
+
+        def complete_vision_json(self, system, user, image=None, model=None):
+            seen.append(user)
+            return {"text": "x", "reason": "r"}
+
+    quiz.solve(ShortLLM(), {"id": "s1", "type": "short", "text": "?", "answers": ["200"], "answer": 3})
+    assert "200" not in seen[0] and '"answer"' not in seen[0]
