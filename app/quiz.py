@@ -171,13 +171,23 @@ def system_for(question):
     return SYSTEM if question.get("hidden") else SYSTEM_TEXT
 
 
+# 그림 문제: 개수를 대충 세면 틀린다(빨간 원 7개를 빨간 도형 10개로 셈). 모양과 색을 하나씩 적고 센다
+IMAGE_STEPS = (
+    "그림 문제 풀이 순서: think 에 그림 속 물체를 위에서 아래, 왼쪽에서 오른쪽 순서로 한 줄(행)씩 "
+    "'1행: 빨간 원, 파란 네모, …' 처럼 모양과 색을 함께 하나도 빠짐없이 적는다. "
+    "그다음 문제의 조건(색과 모양을 모두)에 맞는 것만 골라 센다. 비슷한 색이나 다른 모양은 세지 않는다. "
+    "차트는 축 이름과 막대(점)의 값을 항목마다 적은 뒤 비교한다. 이때 think 는 한 줄이 아니어도 된다."
+)
+
+
 def build_prompt(question, has_image):
     kind = question.get("type")
     lines = []
     if question.get("hidden"):
         lines.append("하드모드다. 문제 글이 오지 않았으니 함께 보낸 사진(노트북 화면에 띄운 퀴즈 화면을 폰으로 찍은 것)에서 문제와 보기를 읽어라.")
         if question.get("mode") == "image":
-            lines.append("그림 문제다. 사진 속 퀴즈 화면에 있는 그림(차트, 도형 등)을 자세히 보고 푼다. 색깔, 막대 높이, 개수를 꼼꼼히 확인한다.")
+            lines.append("그림 문제다. 사진 속 퀴즈 화면에 있는 그림(차트, 도형 등)을 보고 푼다.")
+            lines.append(IMAGE_STEPS)
         if kind == "choice":
             lines.append(f"객관식이고 보기는 {question.get('choice_count', '?')}개다. 화면에 보이는 보기 번호(1부터)로 choice 를 쓴다.")
         elif kind == "short":
@@ -196,7 +206,8 @@ def build_prompt(question, has_image):
         else:
             lines.append("단답형이다. text 에 답을 쓴다.")
         if has_image:
-            lines.append("문제에 딸린 그림을 함께 보낸다. 그림을 자세히 보고 푼다. 색깔, 막대 높이, 개수를 꼼꼼히 확인한다.")
+            lines.append("문제에 딸린 그림을 함께 보낸다. 그림을 보고 푼다.")
+            lines.append(IMAGE_STEPS)
     return "\n".join(lines)
 
 
