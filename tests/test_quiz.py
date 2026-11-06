@@ -189,3 +189,19 @@ def test_answers_are_not_shown_to_model():
 
     quiz.solve(ShortLLM(), {"id": "s1", "type": "short", "text": "?", "answers": ["200"], "answer": 3})
     assert "200" not in seen[0] and '"answer"' not in seen[0]
+
+
+def test_easy_questions_use_short_instructions_without_copying():
+    seen = []
+
+    class SysLLM:
+        model = "t"
+
+        def complete_vision_json(self, system, user, image=None, model=None):
+            seen.append(system)
+            return {"choice": 1, "reason": "r"}
+
+    quiz.solve(SysLLM(), {"id": "t1", "type": "choice", "text": "?", "choices": ["a", "b"]})
+    quiz.solve(SysLLM(), {"id": "t1", "type": "choice", "hidden": True, "choice_count": 2}, image=(b"x", "image/jpeg"))
+    assert seen[0] == quiz.SYSTEM_TEXT and '"read"' not in seen[0]
+    assert seen[1] == quiz.SYSTEM and '"read"' in seen[1]
