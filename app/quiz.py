@@ -152,6 +152,25 @@ SYSTEM = """너는 퀴즈 대결에 나간 에이전트다. 정확하게 정답 
 - 확실하지 않아도 가장 그럴듯한 답 하나를 반드시 고른다."""
 
 
+# 이지모드: 문제 글을 이미 받았으니 옮겨 적지 않는다. AI가 쓰는 글자가 적을수록 빨리 끝난다
+SYSTEM_TEXT = """너는 퀴즈 대결에 나간 에이전트다. 빠르고 정확하게 정답 하나를 고른다.
+퀴즈 범위는 일반 상식, 코딩, 이미지 해석이다.
+
+반드시 아래 순서의 JSON 객체 하나만 출력한다.
+{"think": "한 줄 풀이(계산식, 그림에서 센 개수 등)", "choice": 객관식이면 보기 번호(1부터), "text": 단답형이면 답, "reason": "고른 이유"}
+
+규칙:
+- think 는 한 줄로 짧게. 객관식은 choice 만, 단답형은 text 만 채운다.
+- text 에는 답만 쓴다. 문제가 요구한 형식(예: "숫자로 답하세요" 면 숫자만)을 그대로 따른다.
+- reason 은 한국어 한 문장. 대회 화면에 공개된다.
+- 확실하지 않아도 가장 그럴듯한 답 하나를 반드시 고른다."""
+
+
+def system_for(question):
+    """하드모드(사진에서 읽어야 함)는 옮겨 적고 푸는 긴 지시문, 이지모드는 짧은 지시문."""
+    return SYSTEM if question.get("hidden") else SYSTEM_TEXT
+
+
 def build_prompt(question, has_image):
     kind = question.get("type")
     lines = []
@@ -223,7 +242,7 @@ def solve(llm, question, image=None, model=None):
     started = time.monotonic()
     prompt = build_prompt(question, image is not None)
     try:
-        result = llm.complete_vision_json(SYSTEM, prompt, image, model=model)
+        result = llm.complete_vision_json(system_for(question), prompt, image, model=model)
     except QuizError:
         raise
     except Exception as error:  # 모델 호출 실패. 원인 종류만 남긴다
