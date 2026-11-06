@@ -14,6 +14,7 @@
 - /api/memories, /api/reminders, /api/data: 기억, 약속, 내 데이터 관리
 """
 import html
+from datetime import datetime, timezone
 import json
 import logging
 import os
@@ -120,6 +121,12 @@ class QuizSolveRequest(BaseModel):
     question: dict              # 퀴즈 서버 /api/question 의 question 그대로
     server_url: str | None = None  # 그림 문제(mode=image)일 때 그림을 받아 올 퀴즈 서버 주소
     photo: str | None = None       # 하드모드: 앱이 찍은 퀴즈 화면 사진(base64 JPEG)
+
+
+class QuizScoreRequest(BaseModel):
+    trace_id: str               # 풀이 응답에 들어 있던 trace_id
+    correct: bool               # 마감 뒤 공개된 정답과 같았는지
+    note: str = ""              # 예: "내 답 2번 · 정답 2번"
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -372,18 +379,42 @@ def solve_quiz(req: QuizSolveRequest, user: User = Depends(current_user)):
     """퀴즈 대결 앱이 문제를 보내면 답과 이유를 돌려준다. 답 제출은 앱이 퀴즈 서버에 직접 한다.
 
     LLM 키를 앱에 두지 않으려고 풀이만 서버가 맡는다. 크레딧은 빼지 않고, 사용자당 1분 요청 수만 제한한다.
+    풀이 한 번은 Langfuse 트레이스(quiz-solve) 하나다. 응답의 trace_id 로 나중에 정답 점수를 붙인다.
     """
+    q = req.question or {}
+    tags = ["quiz", "hard" if q.get("hidden") else "easy", f"type:{q.get('type', '?')}"]
+    if q.get("mode") == "image":
+        tags.append("image")
     try:
         quiz.check_rate(user.id)
-        image = None
-        if req.photo:
-            # 모니터를 찍은 사진이라 흐리고 대비가 낮다. AI에게 보내기 전에 대비를 높이고 선명하게 손질한다
-            image = (quiz.enhance_photo(quiz.decode_photo(req.photo)), "image/jpeg")
-        elif req.question.get("mode") == "image" and req.question.get("image_url") and not req.question.get("hidden"):
-            image = quiz.fetch_image(req.server_url, req.question["image_url"])
-        return quiz.solve(get_llm(), req.question, image, model=quiz.quiz_model(settings.model))
+        with tracing.user_attributes(user.id, datetime.now(timezone.utc), tags=tags), \
+                tracing.observation("quiz-solve", input={"question": q, "photo": bool(req.photo)}) as span:
+            image = None
+            if req.photo:
+                # 모니터를 찍은 사진이라 흐리고 대비가 낮다. AI에게 보내기 전에 대비를 높이고 선명하게 손질한다
+                image = (quiz.enhance_photo(quiz.decode_photo(req.photo)), "image/jpeg")
+            elif q.get("mode") == "image" and q.get("image_url") and not q.get("hidden"):
+                image = quiz.fetch_image(req.server_url, q["image_url"])
+            result = quiz.solve(get_llm(), q, image, model=quiz.quiz_model(settings.model))
+            trace_id = tracing.current_trace_id()
+            span.update(output=result)
+        quiz.remember_trace(trace_id, user.id)
+        return {**result, "trace_id": trace_id}
     except quiz.QuizError as error:
         raise HTTPException(error.status, str(error)) from error
+    finally:
+        tracing.flush()  # 응답을 닫기 전에 보낸다(Cloud Run 은 응답 뒤 CPU를 거의 주지 않는다)
+
+
+@app.post("/api/quiz/score")
+def score_quiz(req: QuizScoreRequest, user: User = Depends(current_user)):
+    """마감 뒤 앱이 맞았는지 알려 주면 그 풀이 트레이스에 quiz-correct 점수(1/0)를 붙인다. 내 풀이에만 붙인다."""
+    if not quiz.owns_trace(req.trace_id, user.id):
+        raise HTTPException(404, "내 풀이 기록을 찾지 못했습니다")
+    tracing.score(req.trace_id, "quiz-correct", 1 if req.correct else 0, comment=req.note[:100] or None)
+    tracing.flush()
+    log("INFO", "퀴즈 정답 점수", correct=req.correct)
+    return {"ok": True}
 
 
 @app.post("/api/pdf")

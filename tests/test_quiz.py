@@ -225,3 +225,47 @@ def test_image_questions_get_step_by_step_counting():
     quiz.solve(PromptLLM(), text_only)
     assert quiz.IMAGE_STEPS in seen[0] and quiz.IMAGE_STEPS in seen[1]
     assert quiz.IMAGE_STEPS not in seen[2]  # 글 문제는 짧게 푼다
+
+
+def test_solve_response_has_trace_id_key():
+    r = solve(question={"id": "s1", "type": "short", "text": "?"})
+    assert r.status_code == 200 and "trace_id" in r.json()
+
+
+def test_score_only_my_own_quiz_trace(monkeypatch):
+    sent = []
+    monkeypatch.setattr("app.tracing.score", lambda *a, **k: sent.append((a, k)))
+    app.dependency_overrides[current_user] = lambda: User("quiz-owner", anonymous=True)
+    quiz.remember_trace("trace-abc", "quiz-owner")
+    ok = client.post("/api/quiz/score", json={"trace_id": "trace-abc", "correct": True, "note": "내 답 2번 · 정답 2번"})
+    assert ok.status_code == 200
+    assert sent[0][0][:3] == ("trace-abc", "quiz-correct", 1)
+    # 남의 트레이스, 모르는 트레이스에는 붙이지 않는다
+    app.dependency_overrides[current_user] = lambda: User("someone-else", anonymous=True)
+    assert client.post("/api/quiz/score", json={"trace_id": "trace-abc", "correct": False}).status_code == 404
+    assert client.post("/api/quiz/score", json={"trace_id": "nope", "correct": False}).status_code == 404
+    assert len(sent) == 1
+
+
+def test_photo_goes_to_langfuse_as_media_not_text(monkeypatch):
+    from contextlib import contextmanager
+
+    from langfuse.media import LangfuseMedia
+
+    seen = []
+
+    class Step:
+        def update(self, **kwargs):
+            pass
+
+    @contextmanager
+    def fake_observation(name, as_type="span", **fields):
+        seen.append((name, as_type, fields))
+        yield Step()
+
+    monkeypatch.setattr("app.tracing.observation", fake_observation)
+    quiz.solve(RecordingLLM(), {"id": "t1", "type": "choice", "hidden": True, "choice_count": 3}, image=(b"jpg", "image/jpeg"))
+    name, as_type, fields = seen[0]
+    assert (name, as_type) == ("solve", "generation")
+    assert isinstance(fields["input"]["image"], LangfuseMedia)  # 긴 base64 글자가 가리기(mask)에 망가지지 않게 첨부로
+    assert "prompt" in fields["input"] and "system" in fields["input"]
