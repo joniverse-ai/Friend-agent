@@ -205,3 +205,23 @@ def test_easy_questions_use_short_instructions_without_copying():
     quiz.solve(SysLLM(), {"id": "t1", "type": "choice", "hidden": True, "choice_count": 2}, image=(b"x", "image/jpeg"))
     assert seen[0] == quiz.SYSTEM_TEXT and '"read"' not in seen[0]
     assert seen[1] == quiz.SYSTEM and '"read"' in seen[1]
+
+
+def test_image_questions_get_step_by_step_counting():
+    seen = []
+
+    class PromptLLM:
+        model = "t"
+
+        def complete_vision_json(self, system, user, image=None, model=None):
+            seen.append(user)
+            return {"text": "7", "reason": "r"}
+
+    easy = {"id": "i4", "type": "short", "mode": "image", "text": "빨간색 원은 몇 개?", "image_url": "/x"}
+    hard = {"id": "i4", "type": "short", "mode": "image", "hidden": True}
+    text_only = {"id": "s1", "type": "short", "text": "상태 코드?"}
+    quiz.solve(PromptLLM(), easy, image=(b"x", "image/png"))
+    quiz.solve(PromptLLM(), hard, image=(b"x", "image/jpeg"))
+    quiz.solve(PromptLLM(), text_only)
+    assert quiz.IMAGE_STEPS in seen[0] and quiz.IMAGE_STEPS in seen[1]
+    assert quiz.IMAGE_STEPS not in seen[2]  # 글 문제는 짧게 푼다
