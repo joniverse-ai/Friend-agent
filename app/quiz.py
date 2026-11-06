@@ -6,7 +6,10 @@
   그림 문제(mode=image)는 서버가 퀴즈 서버에서 그림을 직접 받아 온다. 허용한 퀴즈 서버 주소만 받는다.
 - 하드모드(hidden=true): 문제 글이 오지 않으므로 앱이 찍은 퀴즈 화면 사진으로 푼다.
 - 모델에게는 보기 번호를 화면처럼 1부터 받고, 퀴즈 서버 형식(0부터)으로 바꿔 돌려준다.
-- 문제와 답은 로그에 남기지 않는다. 종류, 걸린 시간, 모델만 남긴다.
+- 문제와 답은 서버 로그에 남기지 않는다. 종류, 걸린 시간, 모델만 남긴다.
+- Langfuse(켜져 있을 때): 풀이 한 번이 트레이스 하나. AI에게 보낸 사진·지시문과 AI 답(read, think, 답, 이유),
+  토큰과 비용을 남기고, 마감 뒤 앱이 맞았는지 보내면 quiz-correct 점수(1/0)를 붙인다.
+  퀴즈 문제와 퀴즈 화면 사진은 개인정보가 아니다.
 """
 import base64
 import io
@@ -14,11 +17,13 @@ import json
 import os
 import threading
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from urllib.parse import urlparse
 
 import httpx
+from langfuse.media import LangfuseMedia
 
+from app import tracing
 from app.logs import log
 
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
@@ -252,8 +257,16 @@ def solve(llm, question, image=None, model=None):
         raise QuizError(400, "하드모드 문제는 퀴즈 화면 사진이 필요합니다.")
     started = time.monotonic()
     prompt = build_prompt(question, image is not None)
+    system = system_for(question)
+    trace_input = {"system": system, "prompt": prompt}
+    if image is not None:
+        trace_input["image"] = LangfuseMedia(content_bytes=image[0], content_type=image[1])
     try:
-        result = llm.complete_vision_json(system_for(question), prompt, image, model=model)
+        # AI 호출 단계. 안에서 llm 이 모델 이름과 토큰 수를 적는다(비용 계산)
+        with tracing.observation("solve", "generation", model=model or getattr(llm, "model", None),
+                                 input=trace_input) as generation:
+            result = llm.complete_vision_json(system, prompt, image, model=model)
+            generation.update(output=result)
     except QuizError:
         raise
     except Exception as error:  # 모델 호출 실패. 원인 종류만 남긴다
@@ -265,3 +278,24 @@ def solve(llm, question, image=None, model=None):
     log("INFO", "퀴즈 풀이", type=question.get("type"), hidden=bool(question.get("hidden")),
         image=image is not None, ms=ms, model=model or getattr(llm, "model", ""))
     return {**answer, "ms": ms}
+
+
+# ---- 정답 점수 ----
+# 남의 트레이스에 점수를 붙이지 못하게, 풀이한 트레이스가 누구 것인지 서버가 기억한다(최근 1000개, 서버 한 대 안에서만)
+_trace_owner = OrderedDict()
+_TRACE_MEMORY = 1000
+
+
+def remember_trace(trace_id, user_id):
+    if not trace_id:
+        return
+    with _lock:
+        _trace_owner[trace_id] = user_id
+        _trace_owner.move_to_end(trace_id)
+        while len(_trace_owner) > _TRACE_MEMORY:
+            _trace_owner.popitem(last=False)
+
+
+def owns_trace(trace_id, user_id):
+    with _lock:
+        return bool(trace_id) and _trace_owner.get(trace_id) == user_id
