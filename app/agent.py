@@ -26,17 +26,39 @@ from app.tools import TOOLS, Context, run_tool
 GREETING_GAP = timedelta(hours=6)  # 마지막 대화 뒤 이만큼 지나면 앱을 열 때 먼저 말을 건다
 
 
+# 대화 턴의 도구 결과. 약속을 실제로 저장·취소하고도 앞 대화의 "기억할 수 없어"를 따라 "못 한다"고 답하던 문제를 막는다
+# (Main Quest 08, 문제 후보 A: 약속 쓰기 13턴 중 5턴, 신고 2건. 근거와 실험은 REPORT.md, scripts/eval_reply_consistency.py)
+# 실험 결과 세 가지를 함께 쓴다: 이 머리말, 결과 줄마다 성공/실패 표시, 사용자 말 바로 뒤(답 직전) 위치.
+TOOL_RESULT_HEADER = (
+    "[도구 결과]\n"
+    "아래는 이번 턴에 실제로 실행한 결과다. 답은 반드시 이 결과와 맞게 말한다.\n"
+    "성공한 일(약속 저장·취소 등)은 했다고 말한다. 앞의 대화에서 '할 수 없다'고 했더라도 지금 결과를 따른다.\n"
+    "'실패:'로 표시된 일은 하지 못한 것이다. 했다고 말하지 말고, 못 했다는 것과 이유를 짧게 말한 뒤 어떻게 할지 묻는다."
+)
+
+
 def system_prompt(character, now, location, memories, summary, tool_lines=(), clarify=False):
     parts = [build_persona(character),
              f"[지금] {when.label(now)} ({now.tzinfo}), 사용자 지역: {location}\n[달력]\n{when.calendar_hint(now)}"]
     block = memory.memory_block(memories, summary)
     if block:
         parts.append(block)
-    if tool_lines:
+    if tool_lines:  # 먼저 말 걸기(greeting)가 쓰는 정보 줄. 대화 턴의 도구 결과는 tool_result_message 로 따로 붙인다
         parts.append("[도구 결과]\n" + "\n".join(f"- {line}" for line in tool_lines))
     if clarify:
         parts.append("[되묻기]\n사용자가 무엇을 원하는지 확실하지 않다. 짧게 되물어서 확인한다.")
     return "\n\n".join(parts)
+
+
+def tool_result_message(results):
+    """이번 턴의 도구 결과를 답 직전에 붙일 system 메시지로 만든다. 도구를 안 썼으면 None.
+
+    지시문 중간에 두면 바로 앞 대화의 "못 해"를 더 따라 해서, 사용자 말 뒤(답을 만들기 직전)에 둔다.
+    """
+    if not results:
+        return None
+    lines = "\n".join(f"- {'성공' if r.ok else '실패'}: {r.summary}" for r in results)
+    return {"role": "system", "content": TOOL_RESULT_HEADER + "\n" + lines}
 
 
 @tracing.observe(name="chat-turn", capture_input=False, capture_output=False)
@@ -113,12 +135,15 @@ def _turn(message, uid, llm, store, show_panel, settings, now):
 
     # ④ 답 생성
     system = system_prompt(character, now, settings["location"], memories, summary,
-                           [r.summary for r in results], clarify=choice.action == "clarify")
+                           clarify=choice.action == "clarify")
     if show_panel:
         yield {"type": "context", "memories": [m["text"] for m in memories],
                "summary": summary["text"] if summary else None, "recent_messages": len(history)}
     reply = ""
     messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": message}]
+    tool_message = tool_result_message(results)
+    if tool_message:
+        messages.append(tool_message)
     with tracing.observation("reply", "generation", input=messages) as step:
         for chunk in llm.chat_stream(messages):
             if not reply:  # 첫 글자가 나온 시각. 사용자가 기다린 시간은 여기까지다
