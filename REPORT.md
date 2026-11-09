@@ -132,7 +132,15 @@ A 는 신고가 가장 많이 몰렸고, 한 가지씩 바꿔 실험할 수 있�
 
 ### 화면 캡처
 
-Langfuse › Tracing › Traces 에서 `version` 으로 나눈 화면: `docs/mq08/` (사용자 캡처 추가 예정)
+Langfuse › Tracing › Traces, 오늘(2026-11-09) staging `chat-turn` 을 `version` 필터로 나눈 화면. 같은 14턴 대화가 두 버전에 들어갔다(시각은 한국 시간). 계정 정보가 보이는 왼쪽 메뉴는 잘라 냈다.
+
+**고치기 전 `friend-agent-staging-00065-lim` — 17턴** (첫 실행의 앞 3턴 + 태그로 보낸 14턴)
+
+![Langfuse 트레이스, version 00065](docs/mq08/langfuse-version-00065.png)
+
+**고친 뒤 `friend-agent-staging-00067-guj` — 26턴** (첫 실행의 뒤 11턴 + 두 번째 실행 14턴 + 도구 단계 1)
+
+![Langfuse 트레이스, version 00067](docs/mq08/langfuse-version-00067.png)
 
 ## 6. 회고
 
